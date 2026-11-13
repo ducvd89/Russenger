@@ -96,6 +96,8 @@ pub struct Store {
     pub notifications: Vec<(String, String, String)>,
     /// client tags of messages that failed to send (drained by the UI)
     pub failed_sends: Vec<String>,
+    /// stickers seen in chats, newest first: (sticker id, picture address)
+    pub stickers: Vec<(String, String)>,
     /// per thread: time up to which the other person has read our messages
     pub seen: std::collections::HashMap<String, f64>,
     pub db: Option<Db>,
@@ -159,6 +161,7 @@ impl Store {
                 }
             }
         }
+        st.stickers = db.as_ref().map(|d| d.load_stickers(60)).unwrap_or_default();
         st.db = db;
         st
     }
@@ -221,6 +224,18 @@ impl Store {
                 self.self_name = s(ev, "name");
             }
             "needLogin" => self.need_login = true,
+            "stickerSeen" => {
+                let (id, url) = (s(ev, "stickerId"), s(ev, "url"));
+                if !id.is_empty() && !url.is_empty() {
+                    self.stickers.retain(|(i, _)| *i != id);
+                    self.stickers.insert(0, (id.clone(), url.clone()));
+                    self.stickers.truncate(60);
+                    if let Some(db) = &self.db {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0);
+                        db.save_sticker(&id, &url, now);
+                    }
+                }
+            }
             "seen" => {
                 let (th, ts) = (s(ev, "thread"), f(ev, "ts"));
                 let e = self.seen.entry(th).or_insert(0.0);

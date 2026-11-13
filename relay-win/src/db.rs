@@ -31,6 +31,7 @@ impl Db {
              CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
              CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY, kind TEXT, ref TEXT);
              CREATE TABLE IF NOT EXISTS links(id TEXT PRIMARY KEY, json TEXT);
+             CREATE TABLE IF NOT EXISTS stickers(id TEXT PRIMARY KEY, url TEXT, seen REAL);
              CREATE TABLE IF NOT EXISTS reactions(msg TEXT, actor TEXT, emoji TEXT, PRIMARY KEY(msg, actor));
              CREATE TABLE IF NOT EXISTS communities(id TEXT PRIMARY KEY, name TEXT, description TEXT, picture TEXT, members INTEGER);",
         )?;
@@ -54,6 +55,20 @@ impl Db {
         let mut out = Vec::new();
         if let Ok(mut st) = self.conn.prepare("SELECT thread,text,ts FROM messages WHERE system=0 AND ulower(text) LIKE ?1 ESCAPE '\\' ORDER BY ts DESC LIMIT ?2") {
             if let Ok(rows) = st.query_map(params![like, limit as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, Option<f64>>(2)?.unwrap_or(0.0)))) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
+    }
+
+    pub fn save_sticker(&self, id: &str, url: &str, seen: f64) {
+        let _ = self.conn.execute("INSERT OR REPLACE INTO stickers(id,url,seen) VALUES(?1,?2,?3)", params![id, url, seen]);
+    }
+    /// Stickers seen in chats, newest first: (sticker id, picture address).
+    pub fn load_stickers(&self, limit: usize) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Ok(mut st) = self.conn.prepare("SELECT id,url FROM stickers ORDER BY seen DESC LIMIT ?1") {
+            if let Ok(rows) = st.query_map(params![limit as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
                 out.extend(rows.flatten());
             }
         }

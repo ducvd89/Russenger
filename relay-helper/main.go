@@ -140,6 +140,11 @@ func main() {
 			if thread != "" && path != "" {
 				sendQ <- func() { sendMediaMessage(thread, path, caption) }
 			}
+		case "sendSticker":
+			thread, _ := m["thread"].(string)
+			if id := toInt64(m["stickerId"]); thread != "" && id != 0 {
+				sendQ <- func() { sendSticker(thread, id) }
+			}
 		case "sendGif":
 			thread, _ := m["thread"].(string)
 			url, _ := m["url"].(string)
@@ -675,6 +680,7 @@ func processTable(tbl *table.LSTable, live bool) {
 			url = a.ImageUrl
 		}
 		if a.MessageId != "" && url != "" {
+			noteSticker(a.MessageId, 0, url)
 			emit(map[string]any{"type": "media", "id": a.MessageId, "thread": emitThreadID(a.ThreadKey), "kind": "sticker", "url": url})
 		}
 	}
@@ -710,6 +716,7 @@ func processTable(tbl *table.LSTable, live bool) {
 			emitUnsent(m.MessageId, m.ThreadKey)
 			continue
 		}
+		noteSticker(m.MessageId, m.StickerId, "")
 		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, likeText(m.StickerId, m.Text), m.IsAdminMessage,
 			m.ReplySourceId, m.ReplyMessageText, m.ReplyToUserId)
 	}
@@ -1234,4 +1241,63 @@ func likeText(stickerID int64, text string) string {
 		return "👍"
 	}
 	return text
+}
+
+// Stickers seen in chats (their id comes with the message row, their picture with the attachment
+// row). Once both are known the app is told, so it can offer them again as "recent stickers".
+var (
+	stickerMu   sync.Mutex
+	stickerIDs  = map[string]int64{}
+	stickerURLs = map[string]string{}
+	stickerDone = map[string]bool{}
+)
+
+func noteSticker(msgID string, id int64, url string) {
+	if msgID == "" {
+		return
+	}
+	switch id {
+	case 369239263222822, 369239343222814, 369239383222810: // the Like button, not a real sticker
+		id = 0
+	}
+	stickerMu.Lock()
+	defer stickerMu.Unlock()
+	if id != 0 {
+		stickerIDs[msgID] = id
+	}
+	if url != "" {
+		stickerURLs[msgID] = url
+	}
+	if stickerDone[msgID] || stickerIDs[msgID] == 0 || stickerURLs[msgID] == "" {
+		return
+	}
+	stickerDone[msgID] = true
+	if len(stickerDone) > 5000 { // keep memory small; a repeat only re-announces a sticker
+		stickerDone = map[string]bool{}
+		stickerIDs = map[string]int64{}
+		stickerURLs = map[string]string{}
+	}
+	emit(map[string]any{"type": "stickerSeen", "stickerId": fmt.Sprint(stickerIDs[msgID]), "url": stickerURLs[msgID]})
+}
+
+// sendSticker sends one of the stickers seen before into a regular chat.
+func sendSticker(threadStr string, stickerID int64) {
+	tid, err := strconv.ParseInt(threadStr, 10, 64)
+	if err != nil || client == nil {
+		emit(map[string]any{"type": "error", "msg": "stickers can only be sent in regular chats"})
+		return
+	}
+	task := &socket.SendMessageTask{
+		ThreadId:         tid,
+		Otid:             methods.GenerateEpochID(),
+		Source:           table.MESSENGER_INBOX_IN_THREAD,
+		InitiatingSource: table.FACEBOOK_INBOX,
+		SendType:         table.STICKER,
+		SyncGroup:        1,
+		StickerId:        stickerID,
+	}
+	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
+		log.Error().Err(err).Msg("send sticker failed")
+		emit(map[string]any{"type": "error", "msg": "sticker: " + err.Error()})
+	}
 }

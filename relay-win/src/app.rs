@@ -47,6 +47,7 @@ enum Action {
     ViewImage { thread: String, id: String },
     Play(String),
     Call { thread: String, video: bool },
+    SendSticker { thread: String, id: String },
 }
 
 /// Left-rail tabs, like Messenger web's sidebar (and Telegram's folders).
@@ -125,6 +126,7 @@ pub struct App {
     viewer: Option<Viewer>,
     tab: Tab,
     emoji_open: bool,
+    sticker_open: bool,
     /// failed connection attempts in a row (drives the retry delay)
     retry: u32,
     last_title: String,
@@ -492,6 +494,7 @@ impl App {
             viewer: None,
             tab: Tab::Chats,
             emoji_open: false,
+            sticker_open: false,
             retry: 0,
             last_title: String::new(),
             settings_open: false,
@@ -874,6 +877,10 @@ impl App {
                         self.send_cmd(json!({"cmd": "loadEncryptedHistory", "thread": th, "before": 0}));
                     }
                 }
+            }
+            Action::SendSticker { thread, id } => {
+                self.send_cmd(json!({"cmd": "sendSticker", "thread": thread, "stickerId": id}));
+                self.scroll_bottom = true;
             }
             Action::OpenUrl(t) => notify::open_url(&t),
             Action::SaveFile(src) => {
@@ -1488,6 +1495,48 @@ impl App {
                                 if let Some(pt) = ui.ctx().pointer_interact_pos() {
                                     if !area.response.rect.contains(pt) && !eb.rect.contains(pt) {
                                         self.emoji_open = false;
+                                    }
+                                }
+                            }
+                        }
+                        // stickers seen in chats can be sent again (regular chats only)
+                        let sb = ui.add(egui::Button::new(RichText::new("Sticker").size(12.5).color(p.secondary)).frame(false)).on_hover_text("Sticker gần đây");
+                        if sb.clicked() {
+                            self.sticker_open = !self.sticker_open;
+                            self.emoji_open = false;
+                        }
+                        if self.sticker_open {
+                            let area = egui::Area::new(egui::Id::new("sticker_picker"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(sb.rect.left_top() - Vec2::new(0.0, 8.0))
+                                .pivot(Align2::LEFT_BOTTOM)
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_width(360.0);
+                                        if is_e2ee {
+                                            ui.label(RichText::new("Chưa gửi được sticker trong chat mã hóa đầu cuối.").size(12.5).color(p.secondary));
+                                        } else if self.store.stickers.is_empty() {
+                                            ui.label(RichText::new("Chưa có sticker nào. Sticker bạn nhận được trong các cuộc trò chuyện sẽ hiện ở đây để gửi lại.").size(12.5).color(p.secondary));
+                                        } else {
+                                            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+                                                    for (sid, url) in &self.store.stickers {
+                                                        let pic = egui::Image::new(media_uri(url)).fit_to_exact_size(Vec2::splat(76.0));
+                                                        if ui.add(egui::Button::image(pic).frame(false)).clicked() {
+                                                            actions.push(Action::SendSticker { thread: th_id.clone(), id: sid.clone() });
+                                                            self.sticker_open = false;
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    });
+                                });
+                            if ui.ctx().input(|i| i.pointer.primary_clicked()) {
+                                if let Some(pt) = ui.ctx().pointer_interact_pos() {
+                                    if !area.response.rect.contains(pt) && !sb.rect.contains(pt) {
+                                        self.sticker_open = false;
                                     }
                                 }
                             }
