@@ -69,6 +69,14 @@ fn install_crash_log() {
 
 fn main() -> eframe::Result {
     install_crash_log();
+    // Tie this process to the same app identity as the Start Menu shortcut and the toasts, so the
+    // taskbar button gets the app's own name and icon.
+    {
+        let id: Vec<u16> = "Russenger.Window".encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+        }
+    }
     // russenger --import-cookies <file>: store a "name=value; ..." cookie file in the DPAPI vault.
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 && args[1] == "--import-cookies" {

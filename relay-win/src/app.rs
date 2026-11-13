@@ -525,6 +525,9 @@ impl App {
                 RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
                 _ => None,
             });
+            if let Some(h) = app.hwnd {
+                crate::tray::set_window_icons(h);
+            }
             if let (Some(h), false) = (app.hwnd, demo) {
                 app.tray = crate::tray::create(h);
             }

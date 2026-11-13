@@ -16,6 +16,26 @@ pub static PARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 static PARKED_AT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
 
+/// Give the window its icons straight from the program's own icon resource (the one the build
+/// embeds), at the sizes the title bar and the taskbar ask for.
+pub fn set_window_icons(hwnd: isize) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON};
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        // winresource stores the icon as resource id 1
+        let load = |w: i32, h: i32| LoadImageW(module, 1 as *const u16, IMAGE_ICON, w, h, LR_SHARED);
+        let big = load(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        let small = load(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        if !big.is_null() {
+            SendMessageW(hwnd as HWND, WM_SETICON, ICON_BIG as usize, big as isize);
+        }
+        if !small.is_null() {
+            SendMessageW(hwnd as HWND, WM_SETICON, ICON_SMALL as usize, small as isize);
+        }
+    }
+}
+
 pub fn hide(hwnd: isize) {
     unsafe {
         let h = hwnd as HWND;
