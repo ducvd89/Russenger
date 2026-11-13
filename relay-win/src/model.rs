@@ -1,0 +1,576 @@
+use crate::db::Db;
+use serde_json::Value;
+use std::collections::HashMap;
+
+#[derive(Default, Clone)]
+pub struct Thread {
+    pub id: String,
+    pub name: String,
+    pub snippet: String,
+    pub picture: String,
+    pub last_activity: f64,
+    pub unread: bool,
+    pub muted: bool,
+    pub contact: Option<String>,
+    /// Messenger thread kind (5 = marketplace, 17-21 = community folder / channels)
+    pub ttype: i64,
+    /// id of the community a channel belongs to ("" / "0" / "-1" = none)
+    pub parent: String,
+    /// "inbox" | "requests" | "archived" | "spam" | "hidden" ("" = unknown, treated as inbox)
+    pub folder: String,
+}
+
+#[derive(Default, Clone)]
+pub struct Community {
+    pub name: String,
+    pub description: String,
+    pub picture: String,
+    pub members: i64,
+}
+
+/// A shared link / reel / post card (Messenger "XMA" attachment) — not a picture the user sent.
+#[derive(Clone, Default)]
+pub struct LinkPreview {
+    pub title: String,
+    pub subtitle: String,
+    pub description: String,
+    pub source: String,
+    pub url: String,
+    pub image: String,
+}
+
+impl LinkPreview {
+    pub fn to_json(&self) -> String {
+        serde_json::json!({"t": self.title, "s": self.subtitle, "d": self.description, "src": self.source, "u": self.url, "i": self.image}).to_string()
+    }
+    pub fn from_json(j: &str) -> Option<Self> {
+        let v: Value = serde_json::from_str(j).ok()?;
+        let g = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        Some(Self { title: g("t"), subtitle: g("s"), description: g("d"), source: g("src"), url: g("u"), image: g("i") })
+    }
+    /// Host name of the link, for display.
+    pub fn domain(&self) -> String {
+        let u = self.url.trim_start_matches("https://").trim_start_matches("http://");
+        u.split('/').next().unwrap_or("").trim_start_matches("www.").to_string()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct Message {
+    pub id: String,
+    pub sender: String,
+    pub text: String,
+    pub ts: f64,
+    pub system: bool,
+    pub reply_text: Option<String>,
+    pub media_kind: Option<String>,
+    /// http(s) URL or a local file path
+    pub media_ref: Option<String>,
+    pub reactions: Vec<(String, String)>,
+    pub pending: bool,
+    pub link: Option<LinkPreview>,
+}
+
+pub const PAGE: usize = 200;
+
+/// Placeholder texts the helper uses for attachment-only messages.
+pub fn is_placeholder(text: &str) -> bool {
+    matches!(text, "📷 Photo" | "💟 Sticker" | "🎬 Video" | "🎤 Voice message" | "📎 File" | "📎 Attachment" | "🔗 Link" | "[Tệp đính kèm]")
+}
+
+#[derive(Default)]
+pub struct Store {
+    pub self_id: String,
+    pub self_name: String,
+    pub ready: bool,
+    pub need_login: bool,
+    pub exited: bool,
+    pub last_error: Option<String>,
+    pub contacts: HashMap<String, String>,
+    pub avatars: HashMap<String, String>,
+    pub threads: HashMap<String, Thread>,
+    pub messages: HashMap<String, Vec<Message>>,
+    pub typing: HashMap<String, bool>,
+    pub presence: HashMap<String, bool>,
+    /// (title, body) pairs produced by live incoming messages, drained by the UI for toasts
+    pub notifications: Vec<(String, String, String)>,
+    /// client tags of messages that failed to send (drained by the UI)
+    pub failed_sends: Vec<String>,
+    /// per thread: time up to which the other person has read our messages
+    pub seen: std::collections::HashMap<String, f64>,
+    pub db: Option<Db>,
+    /// "" (unknown) | "none" | "needPIN" | "restored" | "error"
+    pub history_state: String,
+    pub history_error: Option<String>,
+    pub history_attempts: Option<i64>,
+    pub history_busy: bool,
+    /// threads whose encrypted archive has no older messages left
+    pub history_done: std::collections::HashSet<String>,
+    /// message id -> (kind, url or local path); media events can precede their message
+    pub media: HashMap<String, (String, String)>,
+    /// message id -> link card (events can precede their message, like media)
+    pub links: HashMap<String, LinkPreview>,
+    pub communities: HashMap<String, Community>,
+    pub first_names: HashMap<String, String>,
+}
+
+fn s(v: &Value, k: &str) -> String {
+    match v.get(k) {
+        Some(Value::String(x)) => x.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+fn opt(v: &Value, k: &str) -> Option<String> {
+    let x = s(v, k);
+    if x.is_empty() { None } else { Some(x) }
+}
+fn f(v: &Value, k: &str) -> f64 {
+    v.get(k).and_then(Value::as_f64).unwrap_or(0.0)
+}
+fn b(v: &Value, k: &str) -> bool {
+    v.get(k).and_then(Value::as_bool).unwrap_or(false)
+}
+
+impl Store {
+    pub fn with_db(db: Option<Db>) -> Self {
+        let mut st = Store::default();
+        if let Some(db) = &db {
+            for t in db.load_threads() {
+                st.threads.insert(t.id.clone(), t);
+            }
+            for (id, kind, r) in db.load_media() {
+                st.media.insert(id, (kind, r));
+            }
+            for (id, c) in db.load_communities() {
+                st.communities.insert(id, c);
+            }
+            for (id, j) in db.load_links() {
+                if let Some(l) = LinkPreview::from_json(&j) {
+                    st.links.insert(id, l);
+                }
+            }
+            for (id, (name, avatar)) in db.load_contacts() {
+                if !name.is_empty() {
+                    st.contacts.insert(id.clone(), name);
+                }
+                if !avatar.is_empty() {
+                    st.avatars.insert(id, avatar);
+                }
+            }
+        }
+        st.db = db;
+        st
+    }
+
+    /// Lazily load a thread's stored history the first time it is opened.
+    pub fn ensure_loaded(&mut self, thread: &str) {
+        if self.messages.contains_key(thread) {
+            return;
+        }
+        let list = self.db.as_ref().map(|d| d.load_messages(thread, PAGE)).unwrap_or_default();
+        let list = self.decorate(thread, list);
+        self.messages.insert(thread.to_string(), list);
+    }
+
+    /// Attach pictures, link cards and reactions kept outside the message rows.
+    fn decorate(&self, thread: &str, mut list: Vec<Message>) -> Vec<Message> {
+        let reactions = self.db.as_ref().map(|d| d.load_reactions(thread)).unwrap_or_default();
+        for m in list.iter_mut() {
+            if let Some((k, r)) = self.media.get(&m.id) {
+                m.media_kind = Some(k.clone());
+                m.media_ref = Some(r.clone());
+            }
+            m.link = self.links.get(&m.id).cloned();
+            m.reactions = reactions.iter().filter(|(id, _, _)| *id == m.id).map(|(_, a, e)| (a.clone(), e.clone())).collect();
+        }
+        list
+    }
+
+    /// Show one more page of already stored older messages. Returns how many were added
+    /// (0 = the stored history is used up and the server has to be asked).
+    pub fn load_older_from_db(&mut self, thread: &str) -> usize {
+        let Some(oldest) = self.messages.get(thread).and_then(|l| l.iter().filter(|m| !m.pending).map(|m| m.ts).reduce(f64::min)) else { return 0 };
+        let older = self.db.as_ref().map(|d| d.load_messages_before(thread, oldest, PAGE)).unwrap_or_default();
+        let older = self.decorate(thread, older);
+        let list = self.messages.entry(thread.to_string()).or_default();
+        let mut added = 0;
+        for m in older {
+            if !list.iter().any(|x| x.id == m.id) {
+                list.push(m);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            list.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+        }
+        added
+    }
+
+    pub fn apply(&mut self, ev: &Value) {
+        match s(ev, "type").as_str() {
+            "ready" => {
+                self.ready = true;
+                self.need_login = false;
+                if self.self_id.is_empty() {
+                    self.self_id = s(ev, "self");
+                }
+            }
+            "self" => {
+                self.self_id = s(ev, "id");
+                self.self_name = s(ev, "name");
+            }
+            "needLogin" => self.need_login = true,
+            "seen" => {
+                let (th, ts) = (s(ev, "thread"), f(ev, "ts"));
+                let e = self.seen.entry(th).or_insert(0.0);
+                if ts > *e {
+                    *e = ts;
+                }
+            }
+            "exited" => self.exited = true,
+            "error" => self.last_error = Some(s(ev, "msg")),
+            "sendFailed" => {
+                // the message never left: drop its pending bubble and let the UI give the text back
+                let (tag, th) = (s(ev, "clientTag"), s(ev, "thread"));
+                self.last_error = Some(s(ev, "msg"));
+                if let Some(list) = self.messages.get_mut(&th) {
+                    list.retain(|m| m.id != tag);
+                }
+                self.failed_sends.push(tag);
+            }
+            "contact" => {
+                let (id, name, avatar) = (s(ev, "id"), s(ev, "name"), s(ev, "avatar"));
+                if !name.is_empty() {
+                    self.contacts.insert(id.clone(), name.clone());
+                }
+                if !avatar.is_empty() {
+                    self.avatars.insert(id.clone(), avatar.clone());
+                }
+                let first = s(ev, "firstName");
+                if !first.is_empty() {
+                    self.first_names.insert(id.clone(), first);
+                }
+                if let Some(db) = &self.db {
+                    db.save_contact(&id, &name, &avatar);
+                }
+            }
+            "historyStatus" => {
+                self.history_state = s(ev, "state");
+                self.history_error = opt(ev, "error");
+                self.history_attempts = ev.get("attemptsRemaining").and_then(Value::as_i64);
+                self.history_busy = false;
+            }
+            "historyPage" => {
+                self.history_busy = false;
+                if !b(ev, "hasMore") {
+                    self.history_done.insert(s(ev, "thread"));
+                }
+            }
+            "presence" => {
+                self.presence.insert(s(ev, "id"), b(ev, "online"));
+            }
+            "thread" => {
+                let id = s(ev, "id");
+                let t = self.threads.entry(id.clone()).or_default();
+                t.id = id;
+                t.name = s(ev, "name");
+                t.snippet = s(ev, "snippet");
+                t.picture = s(ev, "picture");
+                t.last_activity = f(ev, "lastActivity");
+                t.unread = b(ev, "unread");
+                t.muted = b(ev, "muted");
+                t.contact = opt(ev, "contact");
+                // encrypted-thread events carry no folder/type: keep what we had
+                if ev.get("folder").is_some() {
+                    t.folder = s(ev, "folder");
+                    t.ttype = ev.get("ttype").and_then(Value::as_i64).unwrap_or(0);
+                    t.parent = s(ev, "parent");
+                }
+                if let Some(db) = &self.db {
+                    db.save_thread(t);
+                }
+            }
+            "community" => {
+                let id = s(ev, "id");
+                let c = Community {
+                    name: s(ev, "name"),
+                    description: s(ev, "description"),
+                    picture: s(ev, "picture"),
+                    members: ev.get("members").and_then(Value::as_i64).unwrap_or(0),
+                };
+                if !id.is_empty() && !c.name.is_empty() {
+                    if let Some(db) = &self.db {
+                        db.save_community(&id, &c);
+                    }
+                    self.communities.insert(id, c);
+                }
+            }
+            "participant" => {
+                // 1:1 threads: remember the other person so the thread can borrow name/avatar
+                let (th, c) = (s(ev, "thread"), s(ev, "contact"));
+                if c != self.self_id && !c.is_empty() {
+                    if let Some(t) = self.threads.get_mut(&th) {
+                        if t.contact.is_none() {
+                            t.contact = Some(c);
+                        }
+                    }
+                }
+            }
+            "message" => {
+                let thread = s(ev, "thread");
+                let mut m = Message {
+                    id: s(ev, "id"),
+                    sender: s(ev, "sender"),
+                    text: s(ev, "text"),
+                    ts: f(ev, "ts"),
+                    system: b(ev, "system"),
+                    reply_text: opt(ev, "replyToText"),
+                    ..Default::default()
+                };
+                // the media event usually arrives before its message
+                if let Some((k, r)) = self.media.get(&m.id) {
+                    m.media_kind = Some(k.clone());
+                    m.media_ref = Some(r.clone());
+                }
+                m.link = self.links.get(&m.id).cloned();
+                let from_other = m.sender != self.self_id;
+                if let Some(db) = &self.db {
+                    db.save_message(&thread, &m);
+                }
+                let (live, text, sender) = (b(ev, "live"), m.text.clone(), m.sender.clone());
+                // the chat list preview and ordering follow the newest message
+                self.bump_preview(&thread, &sender, &text, f(ev, "ts"));
+                // Not opened yet: the DB copy is enough, history is loaded on open.
+                if let Some(list) = self.messages.get_mut(&thread) {
+                    if let Some(old) = list.iter_mut().find(|x| x.id == m.id) {
+                        let (r, mk, mr) = (std::mem::take(&mut old.reactions), old.media_kind.take(), old.media_ref.take());
+                        let (nk, nr, nl) = (m.media_kind.clone(), m.media_ref.clone(), m.link.clone());
+                        let old_link = old.link.take();
+                        *old = m;
+                        old.reactions = r;
+                        old.media_kind = nk.or(mk);
+                        old.media_ref = nr.or(mr);
+                        old.link = nl.or(old_link);
+                    } else {
+                        list.push(m);
+                        list.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+                    }
+                }
+                if live && from_other {
+                    let muted = self.threads.get(&thread).map(|t| t.muted).unwrap_or(false);
+                    if let Some(t) = self.threads.get_mut(&thread) {
+                        t.unread = true;
+                    }
+                    if !muted && !text.is_empty() {
+                        let title = self
+                            .threads
+                            .get(&thread)
+                            .map(|t| self.display_name(t))
+                            .unwrap_or_else(|| self.sender_name(&sender));
+                        self.notifications.push((thread.clone(), title, text));
+                    }
+                }
+            }
+            "linkurl" => {
+                // just the url of a link card (from its CTA row)
+                let (id, url) = (s(ev, "id"), s(ev, "url"));
+                if !url.is_empty() {
+                    let l = self.links.entry(id.clone()).or_default();
+                    l.url = url.clone();
+                    let json = l.to_json();
+                    if let Some(db) = &self.db {
+                        db.set_link(&id, &json);
+                    }
+                    let snapshot = l.clone();
+                    for list in self.messages.values_mut() {
+                        if let Some(m) = list.iter_mut().find(|m| m.id == id) {
+                            m.link = Some(snapshot.clone());
+                        }
+                    }
+                }
+            }
+            "link" => {
+                let id = s(ev, "id");
+                let l = LinkPreview {
+                    title: s(ev, "title"),
+                    subtitle: s(ev, "subtitle"),
+                    description: s(ev, "description"),
+                    source: s(ev, "source"),
+                    url: s(ev, "url"),
+                    image: s(ev, "image"),
+                };
+                let mut l = l;
+                // the CTA row that carries the url may have arrived first
+                if l.url.is_empty() {
+                    if let Some(old) = self.links.get(&id) {
+                        l.url = old.url.clone();
+                    }
+                }
+                // earlier versions stored a link's preview picture as a plain image: drop that
+                if self.media.remove(&id).is_some() {
+                    if let Some(db) = &self.db {
+                        db.delete_media(&id);
+                    }
+                }
+                if let Some(db) = &self.db {
+                    db.set_link(&id, &l.to_json());
+                }
+                for list in self.messages.values_mut() {
+                    if let Some(m) = list.iter_mut().find(|m| m.id == id) {
+                        m.media_kind = None;
+                        m.media_ref = None;
+                        m.link = Some(l.clone());
+                    }
+                }
+                self.links.insert(id, l);
+            }
+            "media" => {
+                let (id, kind) = (s(ev, "id"), s(ev, "kind"));
+                let r = opt(ev, "url").or_else(|| opt(ev, "path"));
+                if let Some(r) = r {
+                    self.media.insert(id.clone(), (kind.clone(), r.clone()));
+                    if let Some(db) = &self.db {
+                        db.set_media(&id, &kind, &r);
+                    }
+                    for list in self.messages.values_mut() {
+                        if let Some(m) = list.iter_mut().find(|m| m.id == id) {
+                            m.media_kind = Some(kind.clone());
+                            m.media_ref = Some(r.clone());
+                        }
+                    }
+                }
+            }
+            "sent" => {
+                // E2EE send reconciliation: swap the local-echo tag for the real id
+                let (tag, id, th) = (s(ev, "clientTag"), s(ev, "id"), s(ev, "thread"));
+                if let Some(list) = self.messages.get_mut(&th) {
+                    let real_exists = list.iter().any(|m| m.id == id);
+                    if real_exists {
+                        list.retain(|m| m.id != tag);
+                    } else if let Some(m) = list.iter_mut().find(|m| m.id == tag) {
+                        m.id = id.clone();
+                        m.pending = false;
+                        if let Some(db) = &self.db {
+                            db.save_message(&th, m);
+                        }
+                    }
+                }
+            }
+            "reaction" => {
+                let (id, emoji, actor) = (s(ev, "id"), s(ev, "emoji"), s(ev, "actor"));
+                if let Some(db) = &self.db {
+                    db.set_reaction(&id, &actor, &emoji);
+                }
+                for list in self.messages.values_mut() {
+                    if let Some(m) = list.iter_mut().find(|m| m.id == id) {
+                        m.reactions.retain(|(a, _)| *a != actor);
+                        if !emoji.is_empty() {
+                            m.reactions.push((actor.clone(), emoji.clone()));
+                        }
+                    }
+                }
+            }
+            "edit" => {
+                let (id, text) = (s(ev, "id"), s(ev, "text"));
+                if let Some(db) = &self.db {
+                    db.edit_message(&id, &text);
+                }
+                for list in self.messages.values_mut() {
+                    if let Some(m) = list.iter_mut().find(|m| m.id == id) {
+                        m.text = text.clone();
+                    }
+                }
+            }
+            "delete" => {
+                // by id across all threads: the thread key can differ between normal and E2EE forms
+                let id = s(ev, "id");
+                if let Some(db) = &self.db {
+                    db.delete_message(&id);
+                }
+                self.media.remove(&id);
+                for list in self.messages.values_mut() {
+                    list.retain(|m| m.id != id);
+                }
+            }
+            "typing" => {
+                self.typing.insert(s(ev, "thread"), b(ev, "composing"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Update a thread's preview line and activity time when a newer message arrives
+    /// (the server only re-sends the thread row occasionally).
+    pub fn bump_preview(&mut self, thread: &str, sender: &str, text: &str, ts: f64) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(t) = self.threads.get(thread) else { return };
+        if ts <= t.last_activity {
+            return;
+        }
+        let group = !thread.starts_with("e:") && t.contact.is_none();
+        let snippet = if sender == self.self_id {
+            format!("Bạn: {text}")
+        } else if group {
+            let who = self
+                .first_names
+                .get(sender)
+                .cloned()
+                .or_else(|| self.contacts.get(sender).map(|n| n.split_whitespace().next().unwrap_or("").to_string()))
+                .unwrap_or_default();
+            if who.is_empty() { text.to_string() } else { format!("{who}: {text}") }
+        } else {
+            text.to_string()
+        };
+        if let Some(t) = self.threads.get_mut(thread) {
+            t.last_activity = ts;
+            t.snippet = snippet;
+            if let Some(db) = &self.db {
+                db.save_thread(t);
+            }
+        }
+    }
+
+    pub fn add_local_echo(&mut self, thread: &str, tag: &str, text: &str) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        self.ensure_loaded(thread);
+        let me = self.self_id.clone();
+        self.bump_preview(thread, &me, text, ts);
+        self.messages.entry(thread.to_string()).or_default().push(Message {
+            id: tag.to_string(),
+            sender: self.self_id.clone(),
+            text: text.to_string(),
+            ts,
+            pending: true,
+            ..Default::default()
+        });
+    }
+
+    pub fn display_name(&self, t: &Thread) -> String {
+        if !t.name.is_empty() {
+            return t.name.clone();
+        }
+        let key = t.contact.clone().unwrap_or_else(|| t.id.trim_start_matches("e:").to_string());
+        self.contacts.get(&key).cloned().unwrap_or(key)
+    }
+
+    pub fn thread_avatar(&self, t: &Thread) -> Option<String> {
+        if !t.picture.is_empty() {
+            return Some(t.picture.clone());
+        }
+        let key = t.contact.clone().unwrap_or_else(|| t.id.trim_start_matches("e:").to_string());
+        self.avatars.get(&key).cloned()
+    }
+
+    pub fn sender_name(&self, id: &str) -> String {
+        if id == self.self_id {
+            return "Bạn".into();
+        }
+        self.contacts.get(id).cloned().unwrap_or_else(|| id.to_string())
+    }
+}

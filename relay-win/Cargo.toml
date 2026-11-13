@@ -1,0 +1,64 @@
+﻿[package]
+name = "russenger"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+default-run = "russenger"
+build = "build.rs"
+
+[[bin]]
+name = "russenger"
+path = "src/main.rs"
+
+[[bin]]
+name = "russenger-login"
+path = "src/bin/login.rs"
+
+[[bin]]
+name = "russenger-player"
+path = "src/bin/player.rs"
+
+[[bin]]
+name = "russenger-call"
+path = "src/bin/call.rs"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
+egui_extras = { version = "0.31", features = ["image", "http", "file", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+rfd = { version = "0.15", default-features = false }
+wry = "0.50"
+tao = "0.32"
+ureq = "2"
+unicode-segmentation = "1"
+tray-icon = { version = "0.19", default-features = false }
+raw-window-handle = "0.6"
+webview2-com = "0.36"
+windows = "0.60"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

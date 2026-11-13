@@ -1,0 +1,15 @@
+# build output
+/relay-win/target/
+/dist/
+/bin/
+*.exe
+*.dll
+
+# backups and local data
+*.bak
+*.log
+*.db
+*.db-wal
+*.db-shm
+cookie*.txt
+shot-*.png
