@@ -140,6 +140,8 @@ pub struct App {
     /// measured height of each message row (by id and bubble width), so rows far outside the
     /// window can be skipped instead of laid out every frame
     row_heights: std::collections::HashMap<(String, i32), f32>,
+    /// per chat: is the view parked at the newest message (then it follows new/growing content)
+    stuck_bottom: std::collections::HashMap<String, bool>,
     /// message hits for the text in the search box: (thread, text, time)
     search_hits: Vec<(String, String, f64)>,
     search_for: String,
@@ -500,6 +502,7 @@ impl App {
             sent_texts: Default::default(),
             pending_since: None,
             row_heights: Default::default(),
+            stuck_bottom: Default::default(),
             search_hits: Vec::new(),
             search_for: String::new(),
             outgoing: Vec::new(),
@@ -1530,7 +1533,10 @@ impl App {
             let metas = row_metas(msgs);
             let is_group = !is_e2ee && thread.contact.is_none();
             let max_w = (ui.available_width() * 0.68).clamp(220.0, 560.0);
-            let want_bottom = std::mem::take(&mut self.scroll_bottom);
+            let stuck = *self.stuck_bottom.get(&th_id).unwrap_or(&true);
+            let user_scrolled = ctx.input(|i| i.smooth_scroll_delta.y != 0.0 || i.raw_scroll_delta.y != 0.0);
+            // a wheel tick must be able to leave the bottom, so no re-alignment in that frame
+            let want_bottom = std::mem::take(&mut self.scroll_bottom) || (stuck && !user_scrolled);
             let mut heights = std::mem::take(&mut self.row_heights);
             if heights.len() > 20_000 {
                 heights.clear();
@@ -1581,10 +1587,12 @@ impl App {
                     ui.add_space(if meta.last { 8.0 } else { 2.0 });
                     heights.insert(key, ui.cursor().top() - top);
                 }
+                ui.add_space(6.0);
+                // Pictures and link cards change height after they were laid out. While the view is
+                // at the bottom, re-align it to the end of the content in this same frame.
                 if want_bottom {
                     ui.scroll_to_cursor(Some(Align::BOTTOM));
                 }
-                ui.add_space(6.0);
             });
 
             self.row_heights = heights;
@@ -1592,6 +1600,8 @@ impl App {
             // scroll-to-bottom floating button
             let max_off = (out.content_size.y - out.inner_rect.height()).max(0.0);
             let away = max_off - out.state.offset.y;
+            let st = self.stuck_bottom.entry(th_id.clone()).or_insert(true);
+            *st = if user_scrolled { away < 40.0 } else { *st || away < 40.0 };
             if away < 40.0 {
                 self.seen_len = msgs.len();
             } else if away > 220.0 {
