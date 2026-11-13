@@ -1504,6 +1504,10 @@ impl App {
                         if sb.clicked() {
                             self.sticker_open = !self.sticker_open;
                             self.emoji_open = false;
+                            if self.sticker_open && self.store.stickers.is_empty() {
+                                // ask for this chat's recent messages again: stickers in them get noted
+                                actions.push(Action::Select(th_id.clone()));
+                            }
                         }
                         if self.sticker_open {
                             let area = egui::Area::new(egui::Id::new("sticker_picker"))

@@ -680,7 +680,7 @@ func processTable(tbl *table.LSTable, live bool) {
 			url = a.ImageUrl
 		}
 		if a.MessageId != "" && url != "" {
-			noteSticker(a.MessageId, 0, url)
+			noteSticker(a.MessageId, a.TargetId, url, false)
 			emit(map[string]any{"type": "media", "id": a.MessageId, "thread": emitThreadID(a.ThreadKey), "kind": "sticker", "url": url})
 		}
 	}
@@ -716,7 +716,7 @@ func processTable(tbl *table.LSTable, live bool) {
 			emitUnsent(m.MessageId, m.ThreadKey)
 			continue
 		}
-		noteSticker(m.MessageId, m.StickerId, "")
+		noteSticker(m.MessageId, m.StickerId, "", true)
 		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, likeText(m.StickerId, m.Text), m.IsAdminMessage,
 			m.ReplySourceId, m.ReplyMessageText, m.ReplyToUserId)
 	}
@@ -725,6 +725,7 @@ func processTable(tbl *table.LSTable, live bool) {
 			emitUnsent(m.MessageId, m.ThreadKey)
 			continue
 		}
+		noteSticker(m.MessageId, m.StickerId, "", true)
 		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, likeText(m.StickerId, m.Text), m.IsAdminMessage,
 			m.ReplySourceId, m.ReplyMessageText, m.ReplyToUserId)
 	}
@@ -733,6 +734,7 @@ func processTable(tbl *table.LSTable, live bool) {
 			emitUnsent(m.MessageId, m.ThreadKey)
 			continue
 		}
+		noteSticker(m.MessageId, m.StickerId, "", true)
 		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, likeText(m.StickerId, m.Text), m.IsAdminMessage,
 			m.ReplySourceId, m.ReplyMessageText, m.ReplyToUserId)
 	}
@@ -1252,7 +1254,9 @@ var (
 	stickerDone = map[string]bool{}
 )
 
-func noteSticker(msgID string, id int64, url string) {
+// noteSticker records half of a sticker's story: its id (from the message row, authoritative, or
+// from the sticker row's target id as a fallback) and/or its picture address.
+func noteSticker(msgID string, id int64, url string, fromMessage bool) {
 	if msgID == "" {
 		return
 	}
@@ -1263,7 +1267,9 @@ func noteSticker(msgID string, id int64, url string) {
 	stickerMu.Lock()
 	defer stickerMu.Unlock()
 	if id != 0 {
-		stickerIDs[msgID] = id
+		if _, have := stickerIDs[msgID]; fromMessage || !have {
+			stickerIDs[msgID] = id
+		}
 	}
 	if url != "" {
 		stickerURLs[msgID] = url
