@@ -140,6 +140,17 @@ func main() {
 			if thread != "" && path != "" {
 				sendQ <- func() { sendMediaMessage(thread, path, caption) }
 			}
+		case "loadMoreThreads":
+			// the app knows the oldest chat it has stored; start the next page after it
+			if k := toInt64(m["refKey"]); k != 0 {
+				oldestMu.Lock()
+				ts := int64(toInt64(m["refTs"]))
+				if oldestTs == 0 || ts < oldestTs {
+					oldestKey, oldestTs = k, ts
+				}
+				oldestMu.Unlock()
+			}
+			go loadMoreThreads(6)
 		case "sendSticker":
 			thread, _ := m["thread"].(string)
 			if id := toInt64(m["stickerId"]); thread != "" && id != 0 {
@@ -311,6 +322,8 @@ func connect(cookieStr string) error {
 		return err
 	}
 	emit(map[string]any{"type": "ready", "self": selfFBID})
+	// the first sync only carries the newest chats; the app asks for older pages once it has
+	// told us where its stored list ends (command loadMoreThreads)
 
 	// Connect the encrypted (E2EE / WhatsApp-protocol) channel for personal chats.
 	go func() {
@@ -575,6 +588,7 @@ func processTable(tbl *table.LSTable, live bool) {
 		if isE2EEKey(th.ThreadKey) {
 			ev["contact"] = fmtID(th.ThreadKey) // keep contact lookup pointed at the raw fbid
 		}
+		noteOldestThread(th.ThreadKey, th.LastActivityTimestampMs, th.ParentThreadKey, normalizeFolder(th.FolderName))
 		emit(ev)
 	}
 	// Attachments arrive as separate rows; their message row has empty text and would
@@ -1305,5 +1319,70 @@ func sendSticker(threadStr string, stickerID int64) {
 	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
 		log.Error().Err(err).Msg("send sticker failed")
 		emit(map[string]any{"type": "error", "msg": "sticker: " + err.Error()})
+	}
+}
+
+var (
+	threadsMu sync.Mutex
+	oldestMu  sync.Mutex
+	oldestKey int64 // the oldest regular chat seen so far: where the next older page starts
+	oldestTs  int64
+)
+
+// noteOldestThread remembers the oldest regular inbox chat that has been received.
+func noteOldestThread(key, ts, parent int64, folder string) {
+	if key == 0 || ts <= 0 || folder != "inbox" || parent > 0 {
+		return
+	}
+	oldestMu.Lock()
+	defer oldestMu.Unlock()
+	if oldestTs == 0 || ts < oldestTs {
+		oldestKey, oldestTs = key, ts
+	}
+}
+
+// loadMoreThreads pulls older pages of the chat list (the first sync only has the newest chats):
+// each page starts after the oldest chat received so far.
+func loadMoreThreads(maxPages int) {
+	if client == nil || !threadsMu.TryLock() {
+		return
+	}
+	defer threadsMu.Unlock()
+	for i := 0; i < maxPages; i++ {
+		oldestMu.Lock()
+		refKey, refTs := oldestKey, oldestTs
+		oldestMu.Unlock()
+		if refKey == 0 {
+			return
+		}
+		task := &socket.FetchThreadsTask{
+			IsAfter:                    0,
+			ParentThreadKey:            -1,
+			ReferenceThreadKey:         refKey,
+			ReferenceActivityTimestamp: refTs,
+			AdditionalPagesToFetch:     0,
+			Cursor:                     client.GetCursor(1),
+			SyncGroup:                  1,
+		}
+		tbl, err := client.ExecuteTasks(context.Background(), task)
+		for wait := 0; err != nil && strings.Contains(err.Error(), "not open") && wait < 10; wait++ {
+			time.Sleep(3 * time.Second) // the socket is still connecting
+			tbl, err = client.ExecuteTasks(context.Background(), task)
+		}
+		if err != nil {
+			log.Error().Err(err).Msg("fetch more threads failed")
+			return
+		}
+		if tbl != nil {
+			processTable(tbl, false)
+		}
+		oldestMu.Lock()
+		moved := oldestTs != refTs
+		oldestMu.Unlock()
+		if !moved { // nothing older came back: the list is complete
+			emit(map[string]any{"type": "threadsDone"})
+			return
+		}
+		time.Sleep(800 * time.Millisecond)
 	}
 }

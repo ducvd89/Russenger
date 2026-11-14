@@ -48,6 +48,7 @@ enum Action {
     Play(String),
     Call { thread: String, video: bool },
     SendSticker { thread: String, id: String },
+    MoreThreads,
 }
 
 /// Left-rail tabs, like Messenger web's sidebar (and Telegram's folders).
@@ -117,6 +118,7 @@ pub struct App {
     focus_input: bool,
     pin: String,
     history_asked: bool,
+    more_threads_asked: bool,
     backend_started: Instant,
     dark: bool,
     scroll_bottom: bool,
@@ -486,6 +488,7 @@ impl App {
             focus_input: false,
             pin: String::new(),
             history_asked: false,
+            more_threads_asked: false,
             backend_started: Instant::now(),
             dark,
             scroll_bottom: false,
@@ -564,6 +567,7 @@ impl App {
         self.store.last_error = None;
         self.reconnect_at = None;
         self.history_asked = false;
+        self.more_threads_asked = false;
         self.backend_started = Instant::now();
         self.store.history_state.clear();
         let c = self.ctx.clone();
@@ -574,6 +578,25 @@ impl App {
             }
             Err(e) => self.store.last_error = Some(format!("Không chạy được relay-helper.exe: {e}")),
         }
+    }
+
+    /// Ask for older chats, starting after the oldest regular chat stored here.
+    fn ask_more_threads(&mut self) {
+        let oldest = self
+            .store
+            .threads
+            .values()
+            .filter(|t| !t.id.starts_with("e:") && tab_of(t) == Some(Tab::Chats) && t.last_activity > 0.0)
+            .min_by(|a, b| a.last_activity.total_cmp(&b.last_activity))
+            .map(|t| (t.id.clone(), t.last_activity as i64));
+        let mut cmd = json!({"cmd": "loadMoreThreads"});
+        if let Some((id, ts)) = oldest {
+            if let Ok(k) = id.parse::<i64>() {
+                cmd["refKey"] = json!(k);
+                cmd["refTs"] = json!(ts);
+            }
+        }
+        self.send_cmd(cmd);
     }
 
     fn send_cmd(&mut self, v: serde_json::Value) {
@@ -882,6 +905,7 @@ impl App {
                 self.send_cmd(json!({"cmd": "sendSticker", "thread": thread, "stickerId": id}));
                 self.scroll_bottom = true;
             }
+            Action::MoreThreads => self.ask_more_threads(),
             Action::OpenUrl(t) => notify::open_url(&t),
             Action::SaveFile(src) => {
                 // never run a received file: offer to save it instead
@@ -1342,6 +1366,9 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new(self.status_text()).size(11.5).color(p.secondary));
+                    if self.store.ready && self.search.trim().is_empty() && ui.small_button("⟳ Chat cũ hơn").on_hover_text("Tải thêm các cuộc trò chuyện cũ hơn").clicked() {
+                        actions.push(Action::MoreThreads);
+                    }
                     if !self.store.ready && self.backend.is_some() && self.store.exited && ui.small_button("Thử lại").clicked() {
                         actions.push(Action::Retry);
                     }
@@ -2132,6 +2159,12 @@ impl eframe::App for App {
                     self.send_cmd(json!({"cmd": "fetchContact", "id": n}));
                 }
             }
+        }
+
+        // the first sync only has the newest chats: ask for older pages once, after the list is in
+        if self.store.ready && !self.more_threads_asked && self.backend.is_some() && self.backend_started.elapsed() > Duration::from_secs(6) {
+            self.more_threads_asked = true;
+            self.ask_more_threads();
         }
 
         // ask whether encrypted history can be restored, once the encrypted channel had time to connect
