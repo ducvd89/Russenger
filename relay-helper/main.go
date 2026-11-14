@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -150,7 +151,7 @@ func main() {
 				}
 				oldestMu.Unlock()
 			}
-			go loadMoreThreads(6)
+			go loadMoreThreads(40)
 		case "sendSticker":
 			thread, _ := m["thread"].(string)
 			if id := toInt64(m["stickerId"]); thread != "" && id != 0 {
@@ -304,7 +305,10 @@ func connect(cookieStr string) error {
 			emit(map[string]any{"type": "error", "msg": "connection: " + e.Err.Error()})
 			os.Exit(1)
 		case *table.LSTable:
-			processTable(e, true)
+			if n := len(e.LSDeleteThenInsertThread); n > 0 {
+				threadRowsSeen.Add(int64(n))
+			}
+			processTable(e, !threadBackfill.Load())
 		}
 	})
 
@@ -1341,13 +1345,24 @@ func noteOldestThread(key, ts, parent int64, folder string) {
 	}
 }
 
-// loadMoreThreads pulls older pages of the chat list (the first sync only has the newest chats):
-// each page starts after the oldest chat received so far.
+// threadBackfill is true while older chat pages are being fetched: whatever arrives then is
+// history, not new activity (no unread badges, no notifications).
+var threadBackfill atomic.Bool
+var threadRowsSeen atomic.Int64
+
+// loadMoreThreads pulls older pages of the chat list (the first sync only has the newest chats).
+// Each page is requested after the oldest regular chat received so far (parent key 0 is the
+// main inbox, -1 holds message requests); the chats arrive over the socket, so wait until they have settled.
 func loadMoreThreads(maxPages int) {
 	if client == nil || !threadsMu.TryLock() {
 		return
 	}
 	defer threadsMu.Unlock()
+	threadBackfill.Store(true)
+	defer func() {
+		time.Sleep(3 * time.Second) // late socket tables of the last page still count as history
+		threadBackfill.Store(false)
+	}()
 	for i := 0; i < maxPages; i++ {
 		oldestMu.Lock()
 		refKey, refTs := oldestKey, oldestTs
@@ -1357,13 +1372,14 @@ func loadMoreThreads(maxPages int) {
 		}
 		task := &socket.FetchThreadsTask{
 			IsAfter:                    0,
-			ParentThreadKey:            -1,
+			ParentThreadKey:            0,
 			ReferenceThreadKey:         refKey,
 			ReferenceActivityTimestamp: refTs,
 			AdditionalPagesToFetch:     0,
 			Cursor:                     client.GetCursor(1),
 			SyncGroup:                  1,
 		}
+		before := threadRowsSeen.Load()
 		tbl, err := client.ExecuteTasks(context.Background(), task)
 		for wait := 0; err != nil && strings.Contains(err.Error(), "not open") && wait < 10; wait++ {
 			time.Sleep(3 * time.Second) // the socket is still connecting
@@ -1376,13 +1392,23 @@ func loadMoreThreads(maxPages int) {
 		if tbl != nil {
 			processTable(tbl, false)
 		}
+		// wait for the chats to arrive and for the flow to settle
+		last, quietSince := before, time.Now()
+		for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+			time.Sleep(400 * time.Millisecond)
+			if n := threadRowsSeen.Load(); n != last {
+				last, quietSince = n, time.Now()
+			} else if last > before && time.Since(quietSince) > 1500*time.Millisecond {
+				break
+			}
+		}
 		oldestMu.Lock()
 		moved := oldestTs != refTs
 		oldestMu.Unlock()
-		if !moved { // nothing older came back: the list is complete
+		if !moved { // nothing older arrived: the list is complete
 			emit(map[string]any{"type": "threadsDone"})
 			return
 		}
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 }
