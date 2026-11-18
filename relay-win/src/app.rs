@@ -161,6 +161,13 @@ pub struct App {
     sidebar_w: f32,
     unread_only: bool,
     keep_in_unread: Option<String>,
+    mention_idx: usize,
+    mention_at: Option<usize>,
+    mention_dismissed_at: Option<usize>,
+    /// `(user_id, inserted_name, is_everyone)` picked from the @mention popup for the current draft
+    draft_mentions: Vec<(String, String, bool)>,
+    /// Right-click context menu on the message input: `(click_pos, sel_min_char, sel_max_char, can_paste)`
+    composer_menu: Option<(egui::Pos2, usize, usize, bool)>,
 }
 
 fn now_ms() -> u128 {
@@ -433,6 +440,100 @@ fn chip(ui: &mut egui::Ui, text: &str, fill: Color32) {
     ui.painter().galley(r.min + Vec2::new(10.0, 3.0), g, Color32::WHITE);
 }
 
+#[derive(Clone)]
+struct MentionCandidate {
+    id: String,
+    name: String,
+    subtitle: String,
+    is_everyone: bool,
+}
+
+/// Folds Vietnamese diacritics + case so typing `@hien` matches `Nguyễn Văn Nhật Hiền`.
+fn fold_vi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        for lc in ch.to_lowercase() {
+            let mapped = match lc {
+                'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ' | 'ấ' | 'ẩ' | 'ẫ' | 'ậ' => 'a',
+                'đ' => 'd',
+                'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' => 'e',
+                'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' => 'i',
+                'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ' | 'ớ' | 'ở' | 'ỡ' | 'ợ' => 'o',
+                'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' => 'u',
+                'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' => 'y',
+                c => c,
+            };
+            out.push(mapped);
+        }
+    }
+    out
+}
+
+/// Finds an active `@query` right before `cursor_chars` on the current line:
+/// returns `(at_char_idx, at_byte_idx, cursor_byte_idx, query)`.
+fn active_mention_query(text: &str, cursor_chars: usize) -> Option<(usize, usize, usize, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let cur = cursor_chars.min(chars.len());
+    if cur == 0 {
+        return None;
+    }
+    let cursor_byte = if cur < chars.len() { chars[cur].0 } else { text.len() };
+    let mut i = cur;
+    while i > 0 {
+        i -= 1;
+        let (byte_pos, ch) = chars[i];
+        if ch == '\n' || ch == '\r' || ch == '\t' {
+            return None;
+        }
+        if ch == '@' {
+            let valid_before = if i == 0 {
+                true
+            } else {
+                let prev = chars[i - 1].1;
+                prev.is_whitespace() || matches!(prev, '(' | '[' | '{' | '"' | '\'' | ',')
+            };
+            if !valid_before {
+                return None;
+            }
+            let query = &text[byte_pos + ch.len_utf8()..cursor_byte];
+            if query.starts_with(char::is_whitespace) {
+                return None;
+            }
+            let q_chars = query.chars().count();
+            let spaces = query.chars().filter(|&c| c == ' ').count();
+            if q_chars > 28 || spaces > 3 {
+                return None;
+            }
+            return Some((i, byte_pos, cursor_byte, query.to_string()));
+        }
+    }
+    None
+}
+
+fn match_mention_tier(name: &str, nick: Option<&str>, q_fold: &str) -> Option<u8> {
+    if q_fold.is_empty() {
+        return Some(0);
+    }
+    let nf = fold_vi(name);
+    let kf = nick.map(fold_vi);
+    if nf.split_whitespace().any(|w| w.starts_with(q_fold))
+        || kf.as_deref().map(|k| k.split_whitespace().any(|w| w.starts_with(q_fold))).unwrap_or(false)
+    {
+        return Some(1);
+    }
+    if nf.starts_with(q_fold) || kf.as_deref().map(|k| k.starts_with(q_fold)).unwrap_or(false) {
+        return Some(2);
+    }
+    if nf.contains(q_fold) || kf.as_deref().map(|k| k.contains(q_fold)).unwrap_or(false) {
+        return Some(3);
+    }
+    None
+}
+
+fn char_to_byte(text: &str, char_idx: usize) -> usize {
+    text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len())
+}
+
 struct RowMeta {
     first: bool,
     last: bool,
@@ -531,6 +632,11 @@ impl App {
             sidebar_w,
             unread_only: false,
             keep_in_unread: None,
+            mention_idx: 0,
+            mention_at: None,
+            mention_dismissed_at: None,
+            draft_mentions: Vec::new(),
+            composer_menu: None,
         };
         {
             // a slow heartbeat so messages are still handled (and toasts shown) while the window is
@@ -897,6 +1003,9 @@ impl App {
         if text.is_empty() {
             return;
         }
+        let draft_mentions = std::mem::take(&mut self.draft_mentions);
+        self.mention_dismissed_at = None;
+        self.mention_at = None;
         if let Some(id) = self.editing.take() {
             self.send_cmd(json!({"cmd": "edit", "thread": th, "id": id, "text": text}));
             self.input.clear();
@@ -908,6 +1017,47 @@ impl App {
         if let Some((id, _, sender)) = self.reply.take() {
             cmd["replyId"] = json!(id);
             cmd["replySender"] = json!(sender);
+        }
+        if !draft_mentions.is_empty() {
+            let mut uniq = draft_mentions;
+            uniq.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            uniq.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+            let mut byte_spans: Vec<(usize, usize, String, bool)> = Vec::new();
+            for (uid, name, is_ev) in uniq {
+                if name.is_empty() {
+                    continue;
+                }
+                let token = format!("@{name}");
+                let mut search_from = 0;
+                while let Some(rel) = text[search_from..].find(&token) {
+                    let start = search_from + rel;
+                    let end = start + token.len();
+                    search_from = start + 1;
+                    let boundary_after = text[end..].chars().next().map(|c| !c.is_alphanumeric()).unwrap_or(true);
+                    let overlaps = byte_spans.iter().any(|&(s, e, _, _)| start < e && end > s);
+                    if boundary_after && !overlaps {
+                        byte_spans.push((start, end, uid.clone(), is_ev));
+                        search_from = end;
+                    }
+                }
+            }
+            byte_spans.sort_by_key(|s| s.0);
+            if !byte_spans.is_empty() {
+                let mentions_json: Vec<serde_json::Value> = byte_spans
+                    .into_iter()
+                    .map(|(s, e, uid, is_ev)| {
+                        let offset = text[..s].encode_utf16().count();
+                        let length = text[s..e].encode_utf16().count();
+                        json!({
+                            "id": uid,
+                            "offset": offset,
+                            "length": length,
+                            "kind": if is_ev { "t" } else { "p" },
+                        })
+                    })
+                    .collect();
+                cmd["mentions"] = json!(mentions_json);
+            }
         }
         self.send_cmd(cmd);
         if self.sent_texts.len() > 100 {
@@ -934,6 +1084,10 @@ impl App {
                 self.reply = None;
                 self.editing = None;
                 self.input.clear();
+                self.draft_mentions.clear();
+                self.mention_dismissed_at = None;
+                self.mention_at = None;
+                self.composer_menu = None;
                 self.focus_input = true;
                 self.request_refresh(&id);
                 self.mark_read(&id);
@@ -970,8 +1124,10 @@ impl App {
             Action::CancelCompose => {
                 if self.editing.take().is_some() {
                     self.input.clear();
+                    self.draft_mentions.clear();
                 }
                 self.reply = None;
+                self.mention_dismissed_at = None;
             }
             Action::Mute { thread, muted } => {
                 self.send_cmd(json!({"cmd": "mute", "thread": thread, "muted": muted}));
@@ -1776,28 +1932,426 @@ impl App {
                             }
                         }
                         let id = egui::Id::new("composer");
-                        let enter = ui.memory(|m| m.has_focus(id)) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                        let is_group_chat = thread.contact.is_none();
+
+                        // Detect active `@query` at the current text cursor for @mention autocomplete.
+                        let cur_chars = egui::text_edit::TextEditState::load(ui.ctx(), id)
+                            .and_then(|st| st.cursor.char_range().map(|r| r.primary.index))
+                            .unwrap_or_else(|| self.input.chars().count());
+                        let raw_mention = active_mention_query(&self.input, cur_chars);
+                        if raw_mention.as_ref().map(|m| m.0) != self.mention_dismissed_at {
+                            if raw_mention.is_none() {
+                                self.mention_dismissed_at = None;
+                            }
+                        }
+                        let active_mention = raw_mention.filter(|(at_c, at_b, _, q)| {
+                            if self.mention_dismissed_at == Some(*at_c) {
+                                return false;
+                            }
+                            // Don't reopen popup inside an already-completed mention followed by more text
+                            let already_completed = self.draft_mentions.iter().any(|(_, nm, _)| {
+                                !nm.is_empty() && q.starts_with(&format!("{nm} "))
+                            });
+                            let _ = at_b;
+                            !already_completed
+                        });
+
+                        let mut candidates: Vec<MentionCandidate> = Vec::new();
+                        if let Some((at_c, _, _, ref q)) = active_mention {
+                            if self.mention_at != Some(at_c) {
+                                self.mention_at = Some(at_c);
+                                self.mention_idx = 0;
+                            }
+                            let q_fold = fold_vi(q.trim());
+                            if is_group_chat
+                                && (q_fold.is_empty()
+                                    || "moi nguoi".starts_with(&q_fold)
+                                    || "everyone".starts_with(&q_fold)
+                                    || "all".starts_with(&q_fold))
+                            {
+                                candidates.push(MentionCandidate {
+                                    id: th_id.trim_start_matches("e:").to_string(),
+                                    name: "mọi người".into(),
+                                    subtitle: "Nhắc tất cả thành viên trong nhóm".into(),
+                                    is_everyone: true,
+                                });
+                            }
+                            let mut scored: Vec<(u8, usize, MentionCandidate)> = Vec::new();
+                            for (order, (cid, mname, mnick)) in self.store.thread_members(&th_id).into_iter().enumerate() {
+                                if let Some(tier) = match_mention_tier(&mname, mnick.as_deref(), &q_fold) {
+                                    scored.push((
+                                        tier,
+                                        order,
+                                        MentionCandidate {
+                                            id: cid,
+                                            name: mname,
+                                            subtitle: mnick.unwrap_or_default(),
+                                            is_everyone: false,
+                                        },
+                                    ));
+                                }
+                            }
+                            scored.sort_by_key(|(tier, order, _)| (*tier, *order));
+                            for (_, _, c) in scored.into_iter().take(30) {
+                                candidates.push(c);
+                            }
+                            if !candidates.is_empty() && self.mention_idx >= candidates.len() {
+                                self.mention_idx = 0;
+                            }
+                        } else {
+                            self.mention_at = None;
+                        }
+
+                        // Intercept Up/Down/Enter/Tab/Escape when the @mention popup is open so Enter
+                        // completes the tag instead of prematurely sending the half-typed message!
+                        let mut picked_mention: Option<MentionCandidate> = None;
+                        let mut nav_scrolled = false;
+                        let composer_focused = ui.memory(|m| m.has_focus(id));
+                        if composer_focused && !candidates.is_empty() {
+                            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                                self.mention_idx = (self.mention_idx + 1) % candidates.len();
+                                nav_scrolled = true;
+                            }
+                            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                                self.mention_idx = (self.mention_idx + candidates.len() - 1) % candidates.len();
+                                nav_scrolled = true;
+                            }
+                            if ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                            }) {
+                                picked_mention = Some(candidates[self.mention_idx].clone());
+                            }
+                            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                                if let Some((at_c, _, _, _)) = active_mention {
+                                    self.mention_dismissed_at = Some(at_c);
+                                }
+                                candidates.clear();
+                            }
+                        }
+
+                        let enter = composer_focused
+                            && picked_mention.is_none()
+                            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
                         let w = ui.available_width() - 52.0;
-                        egui::Frame::new().fill(p.input).corner_radius(CornerRadius::same(18)).inner_margin(Margin::symmetric(14, 8)).show(ui, |ui| {
+                        let pill_frame = egui::Frame::new().fill(p.input).corner_radius(CornerRadius::same(18)).inner_margin(Margin::symmetric(14, 8)).show(ui, |ui| {
                             ui.set_width(w - 28.0);
                             egui::ScrollArea::vertical().max_height(110.0).min_scrolled_height(22.0).show(ui, |ui| {
-                                let r = ui.add(
-                                    egui::TextEdit::multiline(&mut self.input)
-                                        .id(id)
-                                        .frame(false)
-                                        .desired_rows(1)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text(RichText::new("Nhập tin nhắn…").color(p.secondary)),
-                                );
+                                let te_out = egui::TextEdit::multiline(&mut self.input)
+                                    .id(id)
+                                    .frame(false)
+                                    .desired_rows(1)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text(RichText::new("Nhập tin nhắn…").color(p.secondary))
+                                    .show(ui);
+                                let r = &te_out.response;
                                 if self.focus_input {
                                     r.request_focus();
                                     self.focus_input = false;
                                 }
-                                if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                if r.has_focus() && candidates.is_empty() && self.composer_menu.is_none() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                     actions.push(Action::CancelCompose);
                                 }
                             });
                         });
+
+                        // Right-click anywhere inside the composer pill opens the text edit context menu.
+                        if ui.ctx().input(|i| i.pointer.secondary_clicked()) {
+                            if let Some(pt) = ui.ctx().pointer_interact_pos() {
+                                if pill_frame.response.rect.contains(pt) {
+                                    let total = self.input.chars().count();
+                                    let (c_min, c_max) = egui::text_edit::TextEditState::load(ui.ctx(), id)
+                                        .and_then(|st| st.cursor.char_range())
+                                        .map(|cr| {
+                                            let a = cr.primary.index.min(cr.secondary.index).min(total);
+                                            let b = cr.primary.index.max(cr.secondary.index).min(total);
+                                            (a, b)
+                                        })
+                                        .unwrap_or((total, total));
+                                    let can_paste = arboard::Clipboard::new()
+                                        .ok()
+                                        .map(|mut cb| cb.get_text().map(|t| !t.is_empty()).unwrap_or(false) || cb.get_image().is_ok())
+                                        .unwrap_or(false);
+                                    self.composer_menu = Some((pt, c_min, c_max, can_paste));
+                                    self.focus_input = true;
+                                } else {
+                                    self.composer_menu = None;
+                                }
+                            }
+                        }
+
+                        if let Some((anchor, raw_min, raw_max, can_paste)) = self.composer_menu {
+                            let total = self.input.chars().count();
+                            let c_min = raw_min.min(total);
+                            let c_max = raw_max.min(total).max(c_min);
+                            let has_sel = c_min < c_max;
+                            let has_any = total > 0;
+
+                            // Keep the selected range highlighted while the right-click menu is open.
+                            if has_sel {
+                                if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
+                                    st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(c_min),
+                                        egui::text::CCursor::new(c_max),
+                                    )));
+                                    st.store(ui.ctx(), id);
+                                }
+                            }
+
+                            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                                self.composer_menu = None;
+                            } else {
+                                let screen = ui.ctx().screen_rect();
+                                let menu_w = 188.0;
+                                let pos = egui::pos2(
+                                    anchor.x.clamp(screen.left() + 8.0, (screen.right() - menu_w - 8.0).max(8.0)),
+                                    (anchor.y - 4.0).max(screen.top() + 170.0),
+                                );
+                                #[derive(Clone, Copy)]
+                                enum EditMenuOp {
+                                    Cut,
+                                    Copy,
+                                    Paste,
+                                    SelectAll,
+                                    Clear,
+                                }
+                                let mut chosen_op: Option<EditMenuOp> = None;
+                                let menu_area = egui::Area::new(egui::Id::new("composer_ctx_menu"))
+                                    .order(egui::Order::Foreground)
+                                    .fixed_pos(pos)
+                                    .pivot(Align2::LEFT_BOTTOM)
+                                    .show(ui.ctx(), |ui| {
+                                        egui::Frame::new()
+                                            .fill(p.sidebar)
+                                            .stroke(egui::Stroke::new(1.0_f32, p.separator))
+                                            .corner_radius(CornerRadius::same(10))
+                                            .shadow(egui::Shadow {
+                                                offset: [0, 4],
+                                                blur: 14,
+                                                spread: 0,
+                                                color: Color32::from_black_alpha(95),
+                                            })
+                                            .inner_margin(Margin::symmetric(0, 4))
+                                            .show(ui, |ui| {
+                                                ui.set_width(menu_w);
+                                                ui.spacing_mut().item_spacing.y = 0.0;
+                                                let mut draw_item = |ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool, op: EditMenuOp, danger: bool| {
+                                                    let sense = if enabled { Sense::click() } else { Sense::hover() };
+                                                    let (r_item, resp_item) = ui.allocate_exact_size(Vec2::new(menu_w, 30.0), sense);
+                                                    if enabled && resp_item.hovered() {
+                                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                        ui.painter().rect_filled(r_item, CornerRadius::ZERO, p.row_hover);
+                                                    }
+                                                    let fg = if !enabled {
+                                                        p.secondary.gamma_multiply(0.45)
+                                                    } else if danger {
+                                                        p.danger
+                                                    } else {
+                                                        p.text
+                                                    };
+                                                    let sc_col = if enabled { p.secondary } else { p.secondary.gamma_multiply(0.4) };
+                                                    ui.painter().text(
+                                                        egui::pos2(r_item.left() + 12.0, r_item.center().y),
+                                                        Align2::LEFT_CENTER,
+                                                        label,
+                                                        theme::body(13.0),
+                                                        fg,
+                                                    );
+                                                    if !shortcut.is_empty() {
+                                                        ui.painter().text(
+                                                            egui::pos2(r_item.right() - 12.0, r_item.center().y),
+                                                            Align2::RIGHT_CENTER,
+                                                            shortcut,
+                                                            theme::body(11.5),
+                                                            sc_col,
+                                                        );
+                                                    }
+                                                    if enabled && resp_item.clicked() {
+                                                        chosen_op = Some(op);
+                                                    }
+                                                };
+
+                                                draw_item(ui, "Cắt", "Ctrl+X", has_sel, EditMenuOp::Cut, false);
+                                                draw_item(ui, "Sao chép", "Ctrl+C", has_sel, EditMenuOp::Copy, false);
+                                                draw_item(ui, "Dán", "Ctrl+V", can_paste, EditMenuOp::Paste, false);
+                                                ui.add_space(3.0);
+                                                let sep = ui.allocate_space(Vec2::new(menu_w, 1.0)).1;
+                                                ui.painter().rect_filled(sep.shrink2(Vec2::new(8.0, 0.0)), CornerRadius::ZERO, p.separator);
+                                                ui.add_space(3.0);
+                                                draw_item(ui, "Chọn tất cả", "Ctrl+A", has_any, EditMenuOp::SelectAll, false);
+                                                draw_item(ui, "Xóa tất cả", "", has_any, EditMenuOp::Clear, true);
+                                            });
+                                    });
+
+                                if let Some(op) = chosen_op {
+                                    let b_min = char_to_byte(&self.input, c_min);
+                                    let b_max = char_to_byte(&self.input, c_max);
+                                    let mut new_range: Option<egui::text::CCursorRange> = None;
+                                    match op {
+                                        EditMenuOp::Cut => {
+                                            let slice = self.input[b_min..b_max].to_string();
+                                            ui.ctx().copy_text(slice.clone());
+                                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                                let _ = cb.set_text(slice);
+                                            }
+                                            self.input.replace_range(b_min..b_max, "");
+                                            new_range = Some(egui::text::CCursorRange::one(egui::text::CCursor::new(c_min)));
+                                        }
+                                        EditMenuOp::Copy => {
+                                            let slice = self.input[b_min..b_max].to_string();
+                                            ui.ctx().copy_text(slice.clone());
+                                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                                let _ = cb.set_text(slice);
+                                            }
+                                            new_range = Some(egui::text::CCursorRange::two(
+                                                egui::text::CCursor::new(c_min),
+                                                egui::text::CCursor::new(c_max),
+                                            ));
+                                        }
+                                        EditMenuOp::Paste => {
+                                            let pasted_text = arboard::Clipboard::new()
+                                                .ok()
+                                                .and_then(|mut cb| cb.get_text().ok())
+                                                .filter(|s| !s.is_empty());
+                                            if let Some(raw) = pasted_text {
+                                                let clean = raw.replace("\r\n", "\n").replace('\r', "\n");
+                                                let added = clean.chars().count();
+                                                self.input.replace_range(b_min..b_max, &clean);
+                                                new_range = Some(egui::text::CCursorRange::one(egui::text::CCursor::new(c_min + added)));
+                                            } else {
+                                                self.paste_clipboard_image();
+                                            }
+                                        }
+                                        EditMenuOp::SelectAll => {
+                                            let end = self.input.chars().count();
+                                            new_range = Some(egui::text::CCursorRange::two(
+                                                egui::text::CCursor::new(0),
+                                                egui::text::CCursor::new(end),
+                                            ));
+                                        }
+                                        EditMenuOp::Clear => {
+                                            self.input.clear();
+                                            self.draft_mentions.clear();
+                                            new_range = Some(egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+                                        }
+                                    }
+                                    if let Some(rng) = new_range {
+                                        let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+                                        st.cursor.set_char_range(Some(rng));
+                                        st.store(ui.ctx(), id);
+                                    }
+                                    self.composer_menu = None;
+                                    self.focus_input = true;
+                                } else if ui.ctx().input(|i| i.pointer.primary_clicked()) {
+                                    if let Some(pt) = ui.ctx().pointer_interact_pos() {
+                                        if !menu_area.response.rect.contains(pt) {
+                                            self.composer_menu = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Floating @mention suggestion popup anchored cleanly above the input pill.
+                        if !candidates.is_empty() && picked_mention.is_none() {
+                            let popup_pos = egui::pos2(pill_frame.response.rect.left(), pill_frame.response.rect.top() - 8.0);
+                            let pointer_moved = ui.ctx().input(|i| i.pointer.delta() != Vec2::ZERO);
+                            let area = egui::Area::new(egui::Id::new("mention_popup"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(popup_pos)
+                                .pivot(Align2::LEFT_BOTTOM)
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::new()
+                                        .fill(p.sidebar)
+                                        .stroke(egui::Stroke::new(1.0_f32, p.separator))
+                                        .corner_radius(CornerRadius::same(10))
+                                        .shadow(egui::Shadow {
+                                            offset: [0, 4],
+                                            blur: 14,
+                                            spread: 0,
+                                            color: Color32::from_black_alpha(90),
+                                        })
+                                        .inner_margin(Margin::symmetric(0, 4))
+                                        .show(ui, |ui| {
+                                            let popup_w = pill_frame.response.rect.width().clamp(240.0, 320.0);
+                                            ui.set_width(popup_w);
+                                            egui::ScrollArea::vertical().id_salt("mention_scroll").max_height(228.0).auto_shrink([false, true]).show(ui, |ui| {
+                                                ui.spacing_mut().item_spacing.y = 0.0;
+                                                for (idx, cand) in candidates.iter().enumerate() {
+                                                    let is_sel = idx == self.mention_idx;
+                                                    let (row_r, row_resp) = ui.allocate_exact_size(Vec2::new(popup_w, 38.0), Sense::click());
+                                                    if row_resp.hovered() {
+                                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                        if pointer_moved {
+                                                            self.mention_idx = idx;
+                                                        }
+                                                    }
+                                                    if is_sel && nav_scrolled {
+                                                        row_resp.scroll_to_me(None);
+                                                    }
+                                                    if is_sel || row_resp.hovered() {
+                                                        ui.painter().rect_filled(
+                                                            row_r,
+                                                            CornerRadius::ZERO,
+                                                            if is_sel { p.row_selected } else { p.row_hover },
+                                                        );
+                                                    }
+                                                    let av_r = egui::Rect::from_min_size(
+                                                        egui::pos2(row_r.left() + 10.0, row_r.center().y - 14.0),
+                                                        Vec2::splat(28.0),
+                                                    );
+                                                    if cand.is_everyone {
+                                                        ui.painter().circle_filled(av_r.center(), 14.0, p.accent);
+                                                        ui.painter().text(av_r.center(), Align2::CENTER_CENTER, "@", theme::semibold(14.0), Color32::WHITE);
+                                                    } else {
+                                                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(av_r));
+                                                        avatar(&mut child, self.store.avatars.get(&cand.id).map(String::as_str), &cand.name, &cand.id, 28.0);
+                                                    }
+                                                    let fg = if is_sel { Color32::WHITE } else { p.text };
+                                                    let sub = if is_sel { Color32::from_white_alpha(195) } else { p.secondary };
+                                                    let tx = av_r.right() + 9.0;
+                                                    let max_tw = (row_r.right() - tx - 10.0).max(40.0);
+                                                    if cand.subtitle.is_empty() {
+                                                        let fit = fit_text(ui, &format!("@{}", cand.name), &theme::semibold(13.5), max_tw);
+                                                        ui.painter().text(egui::pos2(tx, row_r.center().y), Align2::LEFT_CENTER, fit, theme::semibold(13.5), fg);
+                                                    } else {
+                                                        let fit = fit_text(ui, &format!("@{}", cand.name), &theme::semibold(13.0), max_tw);
+                                                        let sfit = fit_text(ui, &cand.subtitle, &theme::body(11.0), max_tw);
+                                                        ui.painter().text(egui::pos2(tx, row_r.top() + 5.0), Align2::LEFT_TOP, fit, theme::semibold(13.0), fg);
+                                                        ui.painter().text(egui::pos2(tx, row_r.top() + 21.0), Align2::LEFT_TOP, sfit, theme::body(11.0), sub);
+                                                    }
+                                                    if row_resp.clicked() {
+                                                        picked_mention = Some(cand.clone());
+                                                    }
+                                                }
+                                            });
+                                        });
+                                });
+                            if ui.ctx().input(|i| i.pointer.primary_clicked()) {
+                                if let Some(pt) = ui.ctx().pointer_interact_pos() {
+                                    if !area.response.rect.contains(pt) && !pill_frame.response.rect.contains(pt) {
+                                        if let Some((at_c, _, _, _)) = active_mention {
+                                            self.mention_dismissed_at = Some(at_c);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let (Some(cand), Some((at_c, at_b, cur_b, _))) = (picked_mention, active_mention) {
+                            let inserted = format!("@{} ", cand.name);
+                            let new_cursor_char = at_c + inserted.chars().count();
+                            self.input.replace_range(at_b..cur_b, &inserted);
+                            self.draft_mentions.push((cand.id, cand.name, cand.is_everyone));
+                            self.mention_dismissed_at = None;
+                            self.mention_at = None;
+                            self.mention_idx = 0;
+                            if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(new_cursor_char))));
+                                st.store(ui.ctx(), id);
+                            }
+                            self.focus_input = true;
+                        }
                         let has_text = !self.input.trim().is_empty();
                         let t = ui.ctx().animate_bool_with_time(egui::Id::new("send_t"), has_text, 0.15);
                         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
@@ -1814,7 +2368,7 @@ impl App {
             let empty: Vec<Message> = Vec::new();
             let msgs = self.store.messages.get(&th_id).unwrap_or(&empty);
             let metas = row_metas(msgs);
-            let is_group = !is_e2ee && thread.contact.is_none();
+            let is_group = thread.contact.is_none();
             let max_w = (ui.available_width() * 0.68).clamp(220.0, 560.0);
             let stuck = *self.stuck_bottom.get(&th_id).unwrap_or(&true);
             let user_scrolled = ctx.input(|i| i.smooth_scroll_delta.y != 0.0 || i.raw_scroll_delta.y != 0.0);
@@ -2387,6 +2941,26 @@ impl eframe::App for App {
                     self.send_cmd(json!({"cmd": "fetchContact", "id": n}));
                 }
             }
+            if let Some(th) = &self.selected {
+                let unknown_members: Vec<String> = self
+                    .store
+                    .participants
+                    .get(th)
+                    .map(|list| {
+                        list.iter()
+                            .map(|(cid, _)| cid.clone())
+                            .filter(|cid| cid != &self.store.self_id && !self.store.contacts.contains_key(cid) && !self.requested.contains(cid))
+                            .take(5)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for cid in unknown_members {
+                    self.requested.insert(cid.clone());
+                    if let Ok(n) = cid.parse::<i64>() {
+                        self.send_cmd(json!({"cmd": "fetchContact", "id": n}));
+                    }
+                }
+            }
         }
 
         // the first sync only has the newest chats: ask for older pages once, after the list is in
@@ -2522,5 +3096,30 @@ impl eframe::App for App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+
+    #[test]
+    fn vietnamese_folding_and_query_detection() {
+        assert_eq!(fold_vi("Nguyễn Văn Nhật Hiền"), "nguyen van nhat hien");
+        assert_eq!(fold_vi("Đặng Quốc"), "dang quoc");
+        assert_eq!(match_mention_tier("Nguyễn Văn Nhật Hiền", None, "hien"), Some(1));
+        assert_eq!(match_mention_tier("Nguyễn Văn Nhật Hiền", None, "nguyen van"), Some(2));
+
+        // Plain '@' at start or after space opens query
+        let q1 = active_mention_query("@", 1).unwrap();
+        assert_eq!((q1.0, q1.3.as_str()), (0, ""));
+
+        let s = "ê @nhật hi";
+        let q2 = active_mention_query(s, s.chars().count()).unwrap();
+        assert_eq!((q2.0, q2.3.as_str()), (2, "nhật hi"));
+
+        // Email address must NOT trigger @mention popup
+        let email = "mail abc@gmail.com";
+        assert!(active_mention_query(email, email.chars().count()).is_none());
     }
 }

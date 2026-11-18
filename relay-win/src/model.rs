@@ -122,6 +122,9 @@ pub struct Store {
     pub pre_sync_max_ts: HashMap<String, f64>,
     /// Redirect map when an unprefixed / hybrid thread id merges into its canonical "e:<id>" thread.
     pub merged_threads: HashMap<String, String>,
+    /// thread id -> Vec<(contact_id, nickname)> for group/thread @mention autocomplete.
+    pub participants: HashMap<String, Vec<(String, String)>>,
+    pub loaded_participants: std::collections::HashSet<String>,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -250,11 +253,37 @@ impl Store {
                 list.sort_by(|a, b| a.ts.total_cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
             }
         }
+        if let Some(old_parts) = self.participants.remove(from) {
+            let dst = self.participants.entry(to.to_string()).or_default();
+            for (cid, nick) in old_parts {
+                if let Some(ex) = dst.iter_mut().find(|(c, _)| *c == cid) {
+                    if ex.1.is_empty() && !nick.is_empty() {
+                        ex.1 = nick;
+                    }
+                } else {
+                    dst.push((cid, nick));
+                }
+            }
+        }
         if let Some(db) = &self.db {
             db.merge_threads(from, to);
             if let Some(t) = self.threads.get(to) {
                 db.save_thread(t);
             }
+        }
+    }
+
+    fn upsert_participant_mem(&mut self, thread: &str, contact: &str, nickname: &str) {
+        if thread.is_empty() || contact.is_empty() || contact == "0" {
+            return;
+        }
+        let list = self.participants.entry(thread.to_string()).or_default();
+        if let Some(ex) = list.iter_mut().find(|(c, _)| c == contact) {
+            if !nickname.is_empty() {
+                ex.1 = nickname.to_string();
+            }
+        } else {
+            list.push((contact.to_string(), nickname.to_string()));
         }
     }
 
@@ -272,14 +301,83 @@ impl Store {
         self.db.as_ref().and_then(|d| d.find_message_text(reply_id))
     }
 
-    /// Lazily load a thread's stored history the first time it is opened.
+    /// Lazily load a thread's stored history and known participants the first time it is opened.
     pub fn ensure_loaded(&mut self, thread: &str) {
-        if self.messages.contains_key(thread) {
-            return;
+        if !self.messages.contains_key(thread) {
+            let list = self.db.as_ref().map(|d| d.load_messages(thread, PAGE)).unwrap_or_default();
+            let list = self.decorate(thread, list);
+            self.messages.insert(thread.to_string(), list);
         }
-        let list = self.db.as_ref().map(|d| d.load_messages(thread, PAGE)).unwrap_or_default();
-        let list = self.decorate(thread, list);
-        self.messages.insert(thread.to_string(), list);
+        if self.loaded_participants.insert(thread.to_string()) {
+            if let Some(db) = &self.db {
+                let stored = db.load_participants(thread);
+                let recent = db.recent_senders(thread, 150);
+                for (cid, nick) in stored {
+                    self.upsert_participant_mem(thread, &cid, &nick);
+                }
+                for cid in recent {
+                    self.upsert_participant_mem(thread, &cid, "");
+                }
+            }
+            if let Some(c) = self.threads.get(thread).and_then(|t| t.contact.clone()) {
+                self.upsert_participant_mem(thread, &c, "");
+            }
+        }
+    }
+
+    /// Returns `(contact_id, display_name, optional_nickname)` for everyone in `thread` (excluding self),
+    /// ordered with the most recent speakers in `thread` first, then alphabetical by display name.
+    pub fn thread_members(&self, thread: &str) -> Vec<(String, String, Option<String>)> {
+        let mut last_spoke: HashMap<&str, f64> = HashMap::new();
+        if let Some(msgs) = self.messages.get(thread) {
+            for m in msgs.iter().filter(|m| !m.system && !m.sender.is_empty()) {
+                let e = last_spoke.entry(m.sender.as_str()).or_insert(0.0);
+                if m.ts > *e {
+                    *e = m.ts;
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<(String, String, Option<String>, f64)> = Vec::new();
+        let mut push_id = |cid: &str, nick: &str| {
+            if cid.is_empty() || cid == "0" || cid == self.self_id || !seen.insert(cid.to_string()) {
+                return;
+            }
+            let name = self.contacts.get(cid).cloned().unwrap_or_default();
+            let display = if !name.is_empty() {
+                name
+            } else if !nick.is_empty() {
+                nick.to_string()
+            } else {
+                return; // skip unresolved numeric IDs until fetchContact populates their name
+            };
+            let nick_opt = if !nick.is_empty() && nick != display { Some(nick.to_string()) } else { None };
+            let ts = last_spoke.get(cid).copied().unwrap_or(0.0);
+            out.push((cid.to_string(), display, nick_opt, ts));
+        };
+
+        if let Some(parts) = self.participants.get(thread) {
+            for (cid, nick) in parts {
+                push_id(cid, nick);
+            }
+        }
+        if let Some(t) = self.threads.get(thread) {
+            if let Some(c) = &t.contact {
+                push_id(c, "");
+            }
+        }
+        if let Some(msgs) = self.messages.get(thread) {
+            for m in msgs.iter().rev() {
+                if !m.system {
+                    push_id(&m.sender, "");
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            b.3.total_cmp(&a.3)
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        });
+        out.into_iter().map(|(id, name, nick, _)| (id, name, nick)).collect()
     }
 
     /// Attach pictures, link cards and reactions kept outside the message rows.
@@ -374,6 +472,7 @@ impl Store {
                 let id = self.canonical_thread(&s(ev, "thread"));
                 self.threads.remove(&id);
                 self.messages.remove(&id);
+                self.participants.remove(&id);
                 if let Some(db) = &self.db {
                     db.delete_thread(&id);
                 }
@@ -558,16 +657,32 @@ impl Store {
                 }
             }
             "participant" => {
-                // 1:1 threads: remember the other person so the thread can borrow name/avatar
                 let th = self.canonical_thread(&s(ev, "thread"));
                 let c = s(ev, "contact");
-                if c != self.self_id && !c.is_empty() {
-                    if let Some(t) = self.threads.get_mut(&th) {
-                        let is_group = matches!(t.ttype, 2 | 8 | 11 | 16) || (t.ttype >= 17 && t.ttype <= 26);
-                        if t.contact.is_none() && !is_group {
-                            t.contact = Some(c);
+                let nick = s(ev, "nickname");
+                if !th.is_empty() && !c.is_empty() && c != "0" {
+                    self.upsert_participant_mem(&th, &c, &nick);
+                    if let Some(db) = &self.db {
+                        db.save_participant(&th, &c, &nick);
+                    }
+                    if c != self.self_id {
+                        if let Some(t) = self.threads.get_mut(&th) {
+                            let is_group = matches!(t.ttype, 2 | 8 | 11 | 16) || (t.ttype >= 17 && t.ttype <= 26);
+                            if t.contact.is_none() && !is_group {
+                                t.contact = Some(c);
+                            }
                         }
                     }
+                }
+            }
+            "removeParticipant" => {
+                let th = self.canonical_thread(&s(ev, "thread"));
+                let c = s(ev, "contact");
+                if let Some(list) = self.participants.get_mut(&th) {
+                    list.retain(|(cid, _)| cid != &c);
+                }
+                if let Some(db) = &self.db {
+                    db.remove_participant(&th, &c);
                 }
             }
             "message" => {
@@ -583,6 +698,9 @@ impl Store {
                     reply_text,
                     ..Default::default()
                 };
+                if !m.system && !m.sender.is_empty() {
+                    self.upsert_participant_mem(&thread, &m.sender, "");
+                }
                 // the media event usually arrives before its message
                 if let Some((k, r)) = self.media.get(&m.id) {
                     m.media_kind = Some(k.clone());

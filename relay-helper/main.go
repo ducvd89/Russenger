@@ -126,8 +126,9 @@ func main() {
 			replyID, _ := m["replyId"].(string)
 			replySender, _ := m["replySender"].(string)
 			clientTag, _ := m["clientTag"].(string)
+			mentions := parseMentionSpans(m["mentions"])
 			if thread != "" && text != "" {
-				sendQ <- func() { sendMessage(thread, text, replyID, replySender, clientTag) }
+				sendQ <- func() { sendMessage(thread, text, replyID, replySender, clientTag, mentions) }
 			}
 		case "fetchContact":
 			// App asks us to resolve a person it knows by FBID but has no name/avatar for.
@@ -833,6 +834,12 @@ func processTable(tbl *table.LSTable, live bool) {
 			"type": "participant", "thread": emitThreadID(p.ThreadKey),
 			"contact": fmtID(p.ContactId), "nickname": p.Nickname,
 			"admin": p.IsAdmin || p.IsSuperAdmin,
+		})
+	}
+	for _, r := range tbl.LSRemoveParticipantFromThread {
+		emit(map[string]any{
+			"type": "removeParticipant", "thread": emitThreadID(r.ThreadKey),
+			"contact": fmtID(r.ParticipantId),
 		})
 	}
 	for _, a := range tbl.LSUpdateThreadParticipantAdminStatus {
@@ -1706,9 +1713,42 @@ func markReadServer(threadStr, msgID string, msgIDs []string, sender string, tsM
 	}
 }
 
-func sendMessage(threadStr, text, replyID, replySender, clientTag string) {
+type mentionSpan struct {
+	ID     string
+	Offset int
+	Length int
+	Kind   string // "p" = person, "t" = @everyone / thread
+}
+
+func parseMentionSpans(v any) []mentionSpan {
+	arr, ok := v.([]any)
+	if !ok || len(arr) == 0 {
+		return nil
+	}
+	out := make([]mentionSpan, 0, len(arr))
+	for _, item := range arr {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := obj["id"].(string)
+		kind, _ := obj["kind"].(string)
+		off := int(toInt64(obj["offset"]))
+		ln := int(toInt64(obj["length"]))
+		if ln <= 0 || off < 0 {
+			continue
+		}
+		if kind == "" {
+			kind = "p"
+		}
+		out = append(out, mentionSpan{ID: id, Offset: off, Length: ln, Kind: kind})
+	}
+	return out
+}
+
+func sendMessage(threadStr, text, replyID, replySender, clientTag string, mentions []mentionSpan) {
 	if strings.HasPrefix(threadStr, "e:") {
-		sendE2EE(strings.TrimPrefix(threadStr, "e:"), text, replyID, replySender, clientTag)
+		sendE2EE(strings.TrimPrefix(threadStr, "e:"), text, replyID, replySender, clientTag, mentions)
 		return
 	}
 	tid, err := strconv.ParseInt(threadStr, 10, 64)
@@ -1725,6 +1765,29 @@ func sendMessage(threadStr, text, replyID, replySender, clientTag string) {
 		SendType:         table.TEXT,
 		SyncGroup:        syncGroupFor(tid),
 		Text:             text,
+	}
+	if len(mentions) > 0 {
+		var sm socket.Mentions
+		for _, ms := range mentions {
+			if ms.Kind == "t" {
+				sm = append(sm, socket.Mention{
+					ID:     tid,
+					Offset: ms.Offset,
+					Length: ms.Length,
+					Type:   socket.MentionTypeThread,
+				})
+			} else if uid := toInt64(ms.ID); uid != 0 {
+				sm = append(sm, socket.Mention{
+					ID:     uid,
+					Offset: ms.Offset,
+					Length: ms.Length,
+					Type:   socket.MentionTypePerson,
+				})
+			}
+		}
+		if len(sm) > 0 {
+			task.MentionData = sm.ToData()
+		}
 	}
 	if replyID != "" {
 		task.ReplyMetaData = &socket.ReplyMetaData{ReplyMessageId: replyID, ReplySourceType: 1, ReplyType: 0}

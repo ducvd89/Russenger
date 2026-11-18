@@ -495,18 +495,43 @@ func sendE2EEReaction(fbid, targetMsgID, emoji string, targetFromMe bool) error 
 	return err
 }
 
-func sendE2EE(fbid, text, replyID, replySender, clientTag string) {
+func sendE2EE(fbid, text, replyID, replySender, clientTag string, mentions []mentionSpan) {
 	if e2eeClient == nil {
 		emit(map[string]any{"type": "sendFailed", "thread": "e:" + fbid, "clientTag": clientTag, "msg": "E2EE not connected yet"})
 		return
 	}
 	jid := e2eeChatJID(fbid)
+	mt := &waCommon.MessageText{Text: proto.String(text)}
+	if len(mentions) > 0 {
+		seenJID := map[string]bool{}
+		for _, ms := range mentions {
+			if ms.Kind == "t" {
+				mt.Commands = append(mt.Commands, &waCommon.Command{
+					CommandType: waCommon.Command_EVERYONE.Enum(),
+					Offset:      proto.Uint32(uint32(ms.Offset)),
+					Length:      proto.Uint32(uint32(ms.Length)),
+				})
+			} else if ms.ID != "" {
+				mjid := types.JID{User: ms.ID, Server: types.MessengerServer}.String()
+				if !seenJID[mjid] {
+					seenJID[mjid] = true
+					mt.MentionedJID = append(mt.MentionedJID, mjid)
+				}
+				mt.Mentions = append(mt.Mentions, &waCommon.Mention{
+					MentionType:  waCommon.Mention_PROFILE.Enum(),
+					MentionedJID: proto.String(mjid),
+					Offset:       proto.Uint32(uint32(ms.Offset)),
+					Length:       proto.Uint32(uint32(ms.Length)),
+				})
+			}
+		}
+	}
 	msg := &waConsumerApplication.ConsumerApplication{
 		Payload: &waConsumerApplication.ConsumerApplication_Payload{
 			Payload: &waConsumerApplication.ConsumerApplication_Payload_Content{
 				Content: &waConsumerApplication.ConsumerApplication_Content{
 					Content: &waConsumerApplication.ConsumerApplication_Content_MessageText{
-						MessageText: &waCommon.MessageText{Text: proto.String(text)},
+						MessageText: mt,
 					},
 				},
 			},

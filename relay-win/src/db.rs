@@ -42,7 +42,8 @@ impl Db {
              CREATE TABLE IF NOT EXISTS links(id TEXT PRIMARY KEY, json TEXT);
              CREATE TABLE IF NOT EXISTS stickers(id TEXT PRIMARY KEY, url TEXT, seen REAL);
              CREATE TABLE IF NOT EXISTS reactions(msg TEXT, actor TEXT, emoji TEXT, PRIMARY KEY(msg, actor));
-             CREATE TABLE IF NOT EXISTS communities(id TEXT PRIMARY KEY, name TEXT, description TEXT, picture TEXT, members INTEGER);",
+             CREATE TABLE IF NOT EXISTS communities(id TEXT PRIMARY KEY, name TEXT, description TEXT, picture TEXT, members INTEGER);
+             CREATE TABLE IF NOT EXISTS participants(thread TEXT NOT NULL, contact TEXT NOT NULL, nickname TEXT, PRIMARY KEY(thread, contact));",
         )?;
         // pictures are no longer kept on disk: forget rows that pointed into the old cache so the
         // messages fetch a fresh picture link from Facebook when they are opened again
@@ -222,12 +223,51 @@ impl Db {
         }
         let _ = self.conn.execute("UPDATE OR IGNORE messages SET thread=?2 WHERE thread=?1", params![from, to]);
         let _ = self.conn.execute("DELETE FROM messages WHERE thread=?1", params![from]);
+        let _ = self.conn.execute("UPDATE OR IGNORE participants SET thread=?2 WHERE thread=?1", params![from, to]);
+        let _ = self.conn.execute("DELETE FROM participants WHERE thread=?1", params![from]);
         let _ = self.conn.execute("DELETE FROM threads WHERE id=?1", params![from]);
     }
     pub fn delete_thread(&self, id: &str) {
         let _ = self.conn.execute("DELETE FROM threads WHERE id=?1", params![id]);
+        let _ = self.conn.execute("DELETE FROM participants WHERE thread=?1", params![id]);
         let _ = self.conn.execute("DELETE FROM reactions WHERE msg IN (SELECT id FROM messages WHERE thread=?1)", params![id]);
         let _ = self.conn.execute("DELETE FROM messages WHERE thread=?1", params![id]);
+    }
+    pub fn save_participant(&self, thread: &str, contact: &str, nickname: &str) {
+        let _ = self.conn.execute(
+            "INSERT INTO participants(thread,contact,nickname) VALUES(?1,?2,?3)
+             ON CONFLICT(thread,contact) DO UPDATE SET
+               nickname=CASE WHEN excluded.nickname != '' THEN excluded.nickname ELSE nickname END",
+            params![thread, contact, nickname],
+        );
+    }
+    pub fn remove_participant(&self, thread: &str, contact: &str) {
+        let _ = self.conn.execute("DELETE FROM participants WHERE thread=?1 AND contact=?2", params![thread, contact]);
+    }
+    pub fn load_participants(&self, thread: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Ok(mut st) = self.conn.prepare("SELECT contact, nickname FROM participants WHERE thread=?1") {
+            if let Ok(rows) = st.query_map(params![thread], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
+            }) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
+    }
+    /// Recent distinct message senders in a thread (newest speaker first), used so @mention
+    /// autocomplete works even in large community channels or pre-existing local history.
+    pub fn recent_senders(&self, thread: &str, limit: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(mut st) = self.conn.prepare(
+            "SELECT sender FROM messages WHERE thread=?1 AND system=0 AND sender IS NOT NULL AND sender != ''
+             GROUP BY sender ORDER BY MAX(ts) DESC LIMIT ?2",
+        ) {
+            if let Ok(rows) = st.query_map(params![thread, limit as i64], |r| r.get::<_, String>(0)) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
     }
     pub fn save_contact(&self, id: &str, name: &str, avatar: &str) {
         let _ = self.conn.execute(
