@@ -34,7 +34,7 @@ static DARK: Palette = Palette {
     rail: c(0x0B, 0x11, 0x1A),
     sidebar: c(0x17, 0x21, 0x2B),
     row_hover: c(0x20, 0x2B, 0x36),
-    row_selected: c(0x18, 0x5C, 0xC8),
+    row_selected: c(0x2B, 0x52, 0x78),
     accent: c(0x18, 0x77, 0xF2),
     bubble_in: c(0x18, 0x25, 0x33),
     bubble_out: c(0x08, 0x66, 0xFF),
@@ -100,10 +100,28 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.text);
     v.widgets.inactive.weak_bg_fill = p.input;
     v.widgets.hovered.weak_bg_fill = p.row_hover;
+    v.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.active.corner_radius = egui::CornerRadius::same(4);
     ctx.set_visuals(v);
     ctx.style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        s.spacing.scroll.bar_width = 6.0;
+        // Telegram-style overlay pill scrollbar: transparent track, slim rounded thumb inset from edge
+        s.spacing.scroll.floating = true;
+        s.spacing.scroll.floating_allocated_width = 0.0;
+        s.spacing.scroll.floating_width = 4.5;
+        s.spacing.scroll.bar_width = 7.0;
+        s.spacing.scroll.bar_inner_margin = 0.0;
+        s.spacing.scroll.bar_outer_margin = 3.5;
+        s.spacing.scroll.handle_min_length = 36.0;
+        s.spacing.scroll.foreground_color = true;
+        s.spacing.scroll.dormant_background_opacity = 0.0;
+        s.spacing.scroll.active_background_opacity = 0.0;
+        s.spacing.scroll.interact_background_opacity = 0.0;
+        s.spacing.scroll.dormant_handle_opacity = 0.0;
+        s.spacing.scroll.active_handle_opacity = 0.28;
+        s.spacing.scroll.interact_handle_opacity = 0.52;
+        s.interaction.resize_grab_radius_side = 4.0;
     });
 }
 

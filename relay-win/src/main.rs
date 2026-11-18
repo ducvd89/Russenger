@@ -94,10 +94,21 @@ fn main() -> eframe::Result {
     // register the toast identity at every start, long before the first notification
     notify::register_app_id();
     notify::ensure_shortcut();
+    notify::register_protocol();
+    // started by a click on a toast: queue the chat to open, then fall through to the
+    // single-instance check, which hands it to the running window
+    if args.len() == 2 {
+        notify::handle_link_arg(&args[1]);
+    }
     if args.len() == 2 && args[1] == "--test-toast" {
         notify::toast("Russenger", "Thông báo thử", "test");
         std::thread::sleep(std::time::Duration::from_secs(3));
         return Ok(());
+    }
+    // The AMD DX12/OpenGL driver crashes on some machines; Vulkan works. A WGPU_BACKEND set by
+    // the user still wins.
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        std::env::set_var("WGPU_BACKEND", "vulkan");
     }
     let demo = args.iter().any(|a| a == "--demo");
     if !demo && !vault::acquire_single_instance() {
@@ -121,6 +132,15 @@ fn main() -> eframe::Result {
     // While the window is dragged Windows sends a move event for every step and egui redraws for
     // each one; with vsync on, every redraw then waits for the display, which makes dragging feel
     // sluggish. Present without waiting, and keep at most one frame queued.
+    // A chat client does not need the discrete GPU: prefer the integrated one (saves power, and
+    // avoids waking the dGPU). Falls back to whatever exists when there is only one adapter.
+    options.wgpu_options.wgpu_setup = match options.wgpu_options.wgpu_setup {
+        eframe::egui_wgpu::WgpuSetup::CreateNew(mut c) => {
+            c.power_preference = eframe::wgpu::PowerPreference::LowPower;
+            eframe::egui_wgpu::WgpuSetup::CreateNew(c)
+        }
+        other => other,
+    };
     options.wgpu_options.present_mode = eframe::wgpu::PresentMode::AutoNoVsync;
     options.wgpu_options.desired_maximum_frame_latency = Some(1);
     eframe::run_native(

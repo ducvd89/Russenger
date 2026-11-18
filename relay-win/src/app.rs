@@ -141,9 +141,11 @@ pub struct App {
     sent_texts: std::collections::HashMap<String, String>,
     /// when the oldest not yet shown notification arrived (a burst is collected into one toast)
     pending_since: Option<Instant>,
-    /// measured height of each message row (by id and bubble width), so rows far outside the
-    /// window can be skipped instead of laid out every frame
-    row_heights: std::collections::HashMap<(String, i32), f32>,
+    /// measured height of each message row (by id -> (layout signature, height)), so rows far outside
+    /// the window can be skipped while automatically invalidating when text/media/link/grouping changes
+    row_heights: std::collections::HashMap<String, (u64, f32)>,
+    /// last incoming message id acknowledged to server per thread (so arriving history re-syncs E2EE receipts)
+    last_read_msg_id: std::collections::HashMap<String, String>,
     /// per chat: is the view parked at the newest message (then it follows new/growing content)
     stuck_bottom: std::collections::HashMap<String, bool>,
     /// message hits for the text in the search box: (thread, text, time)
@@ -156,6 +158,9 @@ pub struct App {
     hwnd: Option<isize>,
     /// closing the window keeps the program running in the tray
     tray_on: bool,
+    sidebar_w: f32,
+    unread_only: bool,
+    keep_in_unread: Option<String>,
 }
 
 fn now_ms() -> u128 {
@@ -461,6 +466,12 @@ impl App {
         let cache_mb: u64 = db.as_ref().and_then(|d| d.get_setting("cache_mb")).and_then(|v| v.parse().ok()).unwrap_or(1024);
         crate::cache::init(&cc.egui_ctx, cache_mb);
         let db_tray = db.as_ref().and_then(|d| d.get_setting("tray")).map(|v| v != "off").unwrap_or(true);
+        let sidebar_w: f32 = db
+            .as_ref()
+            .and_then(|d| d.get_setting("sidebar_w"))
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(330.0)
+            .clamp(260.0, 520.0);
 
         let demo = std::env::args().any(|a| a == "--demo");
         let (pick_tx, pick_rx) = channel();
@@ -508,6 +519,7 @@ impl App {
             sent_texts: Default::default(),
             pending_since: None,
             row_heights: Default::default(),
+            last_read_msg_id: Default::default(),
             stuck_bottom: Default::default(),
             search_hits: Vec::new(),
             search_for: String::new(),
@@ -516,6 +528,9 @@ impl App {
             tray: None,
             hwnd: None,
             tray_on: db_tray,
+            sidebar_w,
+            unread_only: false,
+            keep_in_unread: None,
         };
         {
             // a slow heartbeat so messages are still handled (and toasts shown) while the window is
@@ -527,6 +542,9 @@ impl App {
                     c.request_repaint();
                 }
             });
+        }
+        if !demo {
+            notify::watch_open_requests(cc.egui_ctx.clone());
         }
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -570,6 +588,7 @@ impl App {
         self.more_threads_asked = false;
         self.backend_started = Instant::now();
         self.store.history_state.clear();
+        self.last_read_msg_id.clear();
         let c = self.ctx.clone();
         match Backend::spawn(move || c.request_repaint()) {
             Ok(mut b) => {
@@ -685,7 +704,9 @@ impl App {
                 evs.push(ev);
             }
         }
+        let mut became_ready = false;
         if !evs.is_empty() {
+            became_ready = evs.iter().any(|ev| ev.get("type").and_then(|v| v.as_str()) == Some("ready"));
             if let Some(db) = &self.store.db {
                 db.begin();
             }
@@ -694,6 +715,18 @@ impl App {
             }
             if let Some(db) = &self.store.db {
                 db.commit();
+            }
+            if let Some(sel) = self.selected.clone() {
+                let canon = self.store.canonical_thread(&sel);
+                if canon != sel {
+                    self.store.ensure_loaded(&canon);
+                    self.selected = Some(canon);
+                }
+            }
+        }
+        if became_ready {
+            if let Some(th) = self.selected.clone() {
+                self.request_refresh(&th);
             }
         }
         if self.store.need_login {
@@ -740,14 +773,91 @@ impl App {
         }
     }
 
+    fn request_refresh(&mut self, thread: &str) {
+        let since_ts = if self.store.ready {
+            self.store.pre_sync_max_ts.remove(thread)
+        } else {
+            self.store.pre_sync_max_ts.get(thread).copied()
+        }
+        .unwrap_or(0.0);
+        if let Some(b) = &mut self.backend {
+            b.refresh_thread(thread, since_ts as i64);
+        }
+    }
+
+    fn latest_incoming_id(&self, thread: &str) -> String {
+        self.store
+            .messages
+            .get(thread)
+            .and_then(|l| {
+                l.iter()
+                    .rev()
+                    .find(|m| !m.pending && !m.system && !self.store.self_id.is_empty() && m.sender != self.store.self_id)
+                    .map(|m| m.id.split('#').next().unwrap_or(&m.id).to_string())
+            })
+            .unwrap_or_default()
+    }
+
     fn mark_read(&mut self, thread: &str) {
-        let last = self.store.messages.get(thread).and_then(|l| l.iter().rev().find(|m| m.sender != self.store.self_id && !m.pending).cloned());
-        if let Some(m) = last {
-            self.send_cmd(json!({"cmd": "markReadServer", "thread": thread, "id": m.id, "sender": m.sender, "ts": m.ts}));
+        let prev_synced = self.store.threads.get(thread).map(|t| t.synced_read_up_to).unwrap_or(0.0);
+        let thread_ts = self.store.threads.get(thread).map(|t| t.last_activity).unwrap_or(0.0);
+        let stored_read = self.store.threads.get(thread).map(|t| t.read_up_to).unwrap_or(0.0);
+        let mut max_msg_ts = 0.0f64;
+        let mut last_in: Option<(String, String)> = None;
+        let mut unread_ids: Vec<String> = Vec::new();
+        if let Some(list) = self.store.messages.get(thread) {
+            for m in list.iter().filter(|m| !m.pending) {
+                max_msg_ts = max_msg_ts.max(m.ts);
+                if !self.store.self_id.is_empty() && m.sender != self.store.self_id && !m.system {
+                    let base_id = m.id.split('#').next().unwrap_or(&m.id).to_string();
+                    if m.ts > prev_synced - 1000.0 && !unread_ids.contains(&base_id) {
+                        unread_ids.push(base_id.clone());
+                    }
+                    last_in = Some((base_id, m.sender.clone()));
+                }
+            }
+        } else if let Some(db) = &self.store.db {
+            if let Some((id, sender)) = db.latest_incoming(thread, &self.store.self_id) {
+                let base_id = id.split('#').next().unwrap_or(&id).to_string();
+                unread_ids.push(base_id.clone());
+                last_in = Some((base_id, sender));
+            }
+        }
+        if unread_ids.len() > 25 {
+            let drop_n = unread_ids.len() - 25;
+            unread_ids.drain(0..drop_n);
+        }
+        let target_ts = thread_ts.max(max_msg_ts).max(stored_read);
+        let (last_id, last_sender) = last_in.unwrap_or_default();
+        let sent_to_server = self.store.ready && self.backend.is_some() && (target_ts > 0.0 || !last_id.is_empty());
+        if sent_to_server {
+            self.send_cmd(json!({
+                "cmd": "markReadServer",
+                "thread": thread,
+                "id": last_id,
+                "ids": unread_ids,
+                "sender": last_sender,
+                "ts": target_ts as i64,
+            }));
+            if !last_id.is_empty() {
+                self.last_read_msg_id.insert(thread.to_string(), last_id);
+            }
         }
         if let Some(t) = self.store.threads.get_mut(thread) {
+            let mut dirty = false;
             if t.unread {
                 t.unread = false;
+                dirty = true;
+            }
+            if target_ts > t.read_up_to {
+                t.read_up_to = target_ts;
+                dirty = true;
+            }
+            if sent_to_server && target_ts > t.synced_read_up_to {
+                t.synced_read_up_to = target_ts;
+                dirty = true;
+            }
+            if dirty {
                 if let Some(db) = &self.store.db {
                     db.save_thread(t);
                 }
@@ -813,7 +923,11 @@ impl App {
 
     fn handle(&mut self, a: Action) {
         match a {
-            Action::Select(id) => {
+            Action::Select(raw_id) => {
+                let id = self.store.canonical_thread(&raw_id);
+                if self.unread_only && self.tab == Tab::Chats {
+                    self.keep_in_unread = Some(id.clone());
+                }
                 self.store.ensure_loaded(&id);
                 self.seen_len = self.store.messages.get(&id).map(|l| l.len()).unwrap_or(0);
                 self.selected = Some(id.clone());
@@ -821,7 +935,7 @@ impl App {
                 self.editing = None;
                 self.input.clear();
                 self.focus_input = true;
-                self.send_cmd(json!({"cmd": "refreshThread", "thread": id}));
+                self.request_refresh(&id);
                 self.mark_read(&id);
                 self.repair_media(&id);
             }
@@ -887,17 +1001,20 @@ impl App {
                     }
                     let oldest = self.store.messages.get(&th).and_then(|l| l.iter().find(|m| !m.pending).cloned());
                     if let Some(m) = oldest {
+                        let base_id = m.id.split('#').next().unwrap_or(&m.id).to_string();
                         let from_me = m.sender == self.store.self_id;
                         if th.starts_with("e:") && self.store.history_state == "restored" {
-                            // encrypted archive: pages are keyed by timestamp
+                            // encrypted archive: pages are keyed by timestamp (+999ms avoids skipping same-second WA msgs)
                             self.store.history_busy = true;
-                            self.send_cmd(json!({"cmd": "loadEncryptedHistory", "thread": th, "before": m.ts as i64}));
+                            self.send_cmd(json!({"cmd": "loadEncryptedHistory", "thread": th, "before": m.ts as i64 + 999}));
                         } else {
-                            self.send_cmd(json!({"cmd": "loadEarlier", "thread": th, "oldestId": m.id, "oldestTs": m.ts, "fromMe": from_me}));
+                            self.send_cmd(json!({"cmd": "loadEarlier", "thread": th, "oldestId": base_id, "oldestTs": m.ts as i64, "fromMe": from_me}));
                         }
                     } else if th.starts_with("e:") && self.store.history_state == "restored" {
                         self.store.history_busy = true;
                         self.send_cmd(json!({"cmd": "loadEncryptedHistory", "thread": th, "before": 0}));
+                    } else {
+                        self.request_refresh(&th);
                     }
                 }
             }
@@ -1216,16 +1333,16 @@ impl App {
     }
 
     fn draw_thread_list(&mut self, ctx: &egui::Context, p: &'static Palette, actions: &mut Vec<Action>) {
-        egui::SidePanel::left("threads")
-            .resizable(true)
-            .default_width(330.0)
-            .width_range(260.0..=520.0)
+        let panel = egui::SidePanel::left("threads")
+            .resizable(false)
+            .exact_width(self.sidebar_w)
+            .show_separator_line(true)
             .frame(egui::Frame::new().fill(p.sidebar))
             .show(ctx, |ui| {
-                // header: menu + search pill
+                // header: menu + search pill (Telegram-style balanced margins)
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     ui.menu_button(RichText::new("☰").size(18.0).color(p.secondary), |ui| {
                         let label = if self.dark { "☀ Giao diện sáng" } else { "🌙 Giao diện tối" };
                         if ui.button(label).clicked() {
@@ -1241,30 +1358,76 @@ impl App {
                             ui.close_menu();
                         }
                     });
+                    let pill_w = (ui.available_width() - 34.0).max(80.0);
                     egui::Frame::new().fill(p.input).corner_radius(CornerRadius::same(18)).inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.search)
                                 .frame(false)
                                 .hint_text(RichText::new("🔍 Tìm kiếm").color(p.secondary))
-                                .desired_width(ui.available_width() - 14.0),
+                                .desired_width(pill_w),
                         );
                     });
                 });
                 ui.add_space(6.0);
 
-                // tab title
+                // tab title / unread filter chips (for Chat tab)
+                let chats_unread_n = if self.tab == Tab::Chats {
+                    self.store.threads.values().filter(|t| tab_of(t) == Some(Tab::Chats) && t.unread).count()
+                } else {
+                    0
+                };
                 ui.horizontal(|ui| {
-                    ui.add_space(14.0);
-                    ui.label(RichText::new(self.tab_title()).font(theme::semibold(13.5)).color(p.secondary));
+                    ui.add_space(12.0);
+                    if self.tab == Tab::Chats {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let draw_chip = |ui: &mut egui::Ui, label: &str, active: bool| -> bool {
+                            let font = if active { theme::semibold(12.5) } else { theme::body(12.5) };
+                            let fg = if active { Color32::WHITE } else { p.secondary };
+                            let g = ui.painter().layout_no_wrap(label.to_string(), font, fg);
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 20.0, 24.0), Sense::click());
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            let fill = if active {
+                                p.row_selected
+                            } else if resp.hovered() {
+                                p.row_hover
+                            } else {
+                                p.input
+                            };
+                            ui.painter().rect_filled(rect, CornerRadius::same(12), fill);
+                            ui.painter().galley(egui::pos2(rect.center().x - g.size().x * 0.5, rect.center().y - g.size().y * 0.5), g, fg);
+                            resp.clicked()
+                        };
+                        if draw_chip(ui, "Tất cả", !self.unread_only) {
+                            self.unread_only = false;
+                            self.keep_in_unread = None;
+                        }
+                        let unread_lbl = if chats_unread_n > 0 {
+                            format!("Chưa đọc · {chats_unread_n}")
+                        } else {
+                            "Chưa đọc".into()
+                        };
+                        if draw_chip(ui, &unread_lbl, self.unread_only) {
+                            self.unread_only = !self.unread_only;
+                            self.keep_in_unread = None;
+                        }
+                    } else {
+                        // truncated: a long community name must not force the panel wider than the user set
+                        ui.add(egui::Label::new(RichText::new(self.tab_title()).font(theme::semibold(13.5)).color(p.secondary)).truncate());
+                    }
                 });
+                ui.add_space(4.0);
 
                 let q = self.search.to_lowercase();
+                let filter_unread = q.is_empty() && self.tab == Tab::Chats && self.unread_only;
                 // searching looks through every tab; otherwise only the selected one
                 let mut list: Vec<&Thread> = self
                     .store
                     .threads
                     .values()
                     .filter(|t| if q.is_empty() { tab_of(t).as_ref() == Some(&self.tab) } else { tab_of(t).is_some() })
+                    .filter(|t| !filter_unread || t.unread || self.keep_in_unread.as_deref() == Some(t.id.as_str()))
                     .filter(|t| q.is_empty() || self.store.display_name(t).to_lowercase().contains(&q))
                     .collect();
                 list.sort_by(|a, b| b.last_activity.total_cmp(&a.last_activity));
@@ -1283,41 +1446,51 @@ impl App {
                     self.search_for.clear();
                 }
                 let hits_h = if self.search_hits.is_empty() { 0.0 } else { (area_h * 0.5).max(140.0) };
-                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height((area_h - hits_h).max(60.0)).show_rows(ui, ROW_H, list.len(), |ui, range| {
+                if list.is_empty() && filter_unread {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), (area_h - hits_h).max(60.0)), Sense::hover());
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, rect.top() + 48.0),
+                        Align2::CENTER_CENTER,
+                        "Không có cuộc trò chuyện chưa đọc",
+                        theme::body(13.0),
+                        p.secondary,
+                    );
+                } else {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).drag_to_scroll(false).max_height((area_h - hits_h).max(60.0)).show_rows(ui, ROW_H, list.len(), |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for t in &list[range] {
                         let selected = self.selected.as_deref() == Some(&t.id);
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
                         let hover_t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                         let fill = if selected { p.row_selected } else { p.row_hover.gamma_multiply(hover_t) };
-                        let inner = rect.shrink2(Vec2::new(6.0, 2.0));
-                        ui.painter().rect_filled(inner, CornerRadius::same(10), fill);
+                        // Telegram-style full-bleed row background edge-to-edge up to the divider
+                        ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
 
                         let name = self.store.display_name(t);
-                        let (fg, sub) = if selected { (Color32::WHITE, Color32::from_white_alpha(190)) } else { (p.text, p.secondary) };
-                        let av = egui::Rect::from_min_size(egui::pos2(inner.left() + 8.0, inner.center().y - 24.0), Vec2::splat(48.0));
+                        let (fg, sub) = if selected { (Color32::WHITE, Color32::from_white_alpha(205)) } else { (p.text, p.secondary) };
+                        let av = egui::Rect::from_min_size(egui::pos2(rect.left() + 10.0, rect.center().y - 24.0), Vec2::splat(48.0));
                         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(av));
                         avatar(&mut child, self.store.thread_avatar(t).as_deref(), &name, &t.id, 48.0);
 
                         let tx = av.right() + 10.0;
-                        let right = inner.right() - 10.0;
+                        let right = rect.right() - 13.0;
                         let time = list_time(t.last_activity);
                         let time_g = ui.painter().layout_no_wrap(time, theme::body(12.0), if selected { sub } else { p.secondary });
                         let time_w = time_g.size().x;
                         let name_w = (right - tx - time_w - 8.0).max(30.0);
                         let name_fit = fit_text(ui, &name, &theme::semibold(14.5), name_w);
-                        ui.painter().text(egui::pos2(tx, inner.top() + 8.0), Align2::LEFT_TOP, name_fit, theme::semibold(14.5), fg);
-                        ui.painter().galley(egui::pos2(right - time_w, inner.top() + 10.0), time_g, Color32::PLACEHOLDER);
+                        ui.painter().text(egui::pos2(tx, rect.top() + 10.0), Align2::LEFT_TOP, name_fit, theme::semibold(14.5), fg);
+                        ui.painter().galley(egui::pos2(right - time_w, rect.top() + 12.0), time_g, Color32::PLACEHOLDER);
 
                         let badge_w = if t.unread || t.muted { 22.0 } else { 0.0 };
                         let sn_w = (right - tx - badge_w).max(30.0);
                         let sn_fit = fit_text(ui, &t.snippet, &theme::body(13.5), sn_w);
-                        ui.painter().text(egui::pos2(tx, inner.top() + 31.0), Align2::LEFT_TOP, sn_fit, theme::body(13.5), sub);
+                        ui.painter().text(egui::pos2(tx, rect.top() + 33.0), Align2::LEFT_TOP, sn_fit, theme::body(13.5), sub);
                         if t.unread {
                             let col = if selected { Color32::WHITE } else if t.muted { p.unread_muted } else { p.unread };
-                            ui.painter().circle_filled(egui::pos2(right - 6.0, inner.top() + 40.0), 5.0, col);
+                            ui.painter().circle_filled(egui::pos2(right - 5.0, rect.top() + 42.0), 5.0, col);
                         } else if t.muted {
-                            ui.painter().text(egui::pos2(right - 2.0, inner.top() + 40.0), Align2::RIGHT_CENTER, "🔕", theme::body(12.0), sub);
+                            ui.painter().text(egui::pos2(right - 1.0, rect.top() + 42.0), Align2::RIGHT_CENTER, "🔕", theme::body(12.0), sub);
                         }
 
                         if resp.clicked() {
@@ -1336,9 +1509,10 @@ impl App {
                         });
                     }
                 });
+                }
                 if !self.search_hits.is_empty() {
                     ui.horizontal(|ui| {
-                        ui.add_space(14.0);
+                        ui.add_space(12.0);
                         ui.label(RichText::new("Tin nhắn").font(theme::semibold(13.5)).color(p.secondary));
                     });
                     egui::ScrollArea::vertical().id_salt("search_hits").auto_shrink([false, false]).max_height((hits_h - 26.0).max(40.0)).show(ui, |ui| {
@@ -1347,9 +1521,9 @@ impl App {
                             let name = self.store.threads.get(th).map(|t| self.store.display_name(t)).unwrap_or_default();
                             let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0), Sense::click());
                             if resp.hovered() {
-                                ui.painter().rect_filled(rect.shrink2(Vec2::new(6.0, 2.0)), CornerRadius::same(10), p.row_hover);
+                                ui.painter().rect_filled(rect, CornerRadius::ZERO, p.row_hover);
                             }
-                            let (tx, right) = (rect.left() + 16.0, rect.right() - 16.0);
+                            let (tx, right) = (rect.left() + 12.0, rect.right() - 13.0);
                             let time_g = ui.painter().layout_no_wrap(list_time(*ts), theme::body(12.0), p.secondary);
                             let time_w = time_g.size().x;
                             ui.painter().galley(egui::pos2(right - time_w, rect.top() + 10.0), time_g, Color32::PLACEHOLDER);
@@ -1374,6 +1548,35 @@ impl App {
                     }
                 });
             });
+
+        // Asymmetric resize handle shifted to the right of the 1px divider ([div_x - 1, div_x + 7])
+        // so it NEVER overlaps the sidebar's floating scrollbar ([div_x - 10.5, div_x - 3.5]).
+        let pr = panel.response.rect;
+        let div_x = pr.right();
+        let mut save_w = false;
+        egui::Area::new(egui::Id::new("sidebar_splitter"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(div_x - 1.0, pr.top()))
+            .show(ctx, |ui| {
+                let (_, resp) = ui.allocate_exact_size(Vec2::new(8.0, pr.height()), Sense::drag());
+                if resp.hovered() || resp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if resp.dragged() {
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        let max_w = (ui.ctx().screen_rect().width() - pr.left() - 260.0).clamp(260.0, 560.0);
+                        self.sidebar_w = (pos.x - pr.left()).clamp(260.0, max_w);
+                    }
+                }
+                if resp.drag_stopped() {
+                    save_w = true;
+                }
+            });
+        if save_w {
+            if let Some(db) = &self.store.db {
+                db.set_setting("sidebar_w", &format!("{:.0}", self.sidebar_w));
+            }
+        }
     }
 
     fn draw_pin_card(&mut self, ui: &mut egui::Ui, p: &'static Palette, actions: &mut Vec<Action>) {
@@ -1643,11 +1846,23 @@ impl App {
                 let clip = ui.clip_rect();
                 let gap = ui.spacing().item_spacing.y;
                 for (m, meta) in msgs.iter().zip(metas.iter()) {
-                    let key = (m.id.clone(), max_w as i32);
+                    let is_seen = seen_id.as_deref() == Some(m.id.as_str());
+                    let imageish = matches!(m.media_kind.as_deref(), Some("photo" | "image" | "sticker" | "gif")) && m.media_ref.is_some();
+                    let sig: u64 = ((max_w as u64) << 32)
+                        ^ ((m.text.len() as u64) << 16)
+                        ^ ((m.reactions.len() as u64) << 8)
+                        ^ (u64::from(m.media_ref.is_some()))
+                        ^ (u64::from(m.link.is_some()) << 1)
+                        ^ (u64::from(meta.first) << 2)
+                        ^ (u64::from(meta.last) << 3)
+                        ^ (u64::from(meta.new_day) << 4)
+                        ^ (u64::from(is_seen) << 5)
+                        ^ (u64::from(m.pending) << 6);
                     let top = ui.cursor().top();
-                    if let Some(&h) = heights.get(&key) {
+                    if let Some(&(old_sig, h)) = heights.get(&m.id) {
+                        let img_unloaded = imageish && crate::cache::exists(m.media_ref.as_deref().unwrap_or("")) && h < 64.0;
                         // far above or below the visible part: keep the space, skip the drawing
-                        if top + h < clip.top() - 400.0 || top > clip.bottom() + 400.0 {
+                        if old_sig == sig && !img_unloaded && (top + h < clip.top() - 400.0 || top > clip.bottom() + 400.0) {
                             ui.allocate_exact_size(Vec2::new(1.0, (h - gap).max(0.0)), Sense::hover());
                             continue;
                         }
@@ -1658,14 +1873,14 @@ impl App {
                         ui.add_space(6.0);
                     }
                     self.draw_message(ui, p, &th_id, m, meta, max_w, is_group, &mut actions);
-                    if seen_id.as_deref() == Some(m.id.as_str()) {
+                    if is_seen {
                         ui.with_layout(egui::Layout::right_to_left(Align::Min), |ui| {
                             ui.add_space(8.0);
                             ui.label(RichText::new("✓✓ Đã xem").size(11.0).color(p.secondary));
                         });
                     }
                     ui.add_space(if meta.last { 8.0 } else { 2.0 });
-                    heights.insert(key, ui.cursor().top() - top);
+                    heights.insert(m.id.clone(), (sig, ui.cursor().top() - top));
                 }
                 ui.add_space(6.0);
                 // Pictures and link cards change height after they were laid out. While the view is
@@ -1911,8 +2126,8 @@ impl App {
                     };
 
                     let imageish = matches!(m.media_kind.as_deref(), Some("photo" | "image" | "sticker" | "gif")) && m.media_ref.is_some();
-                    // the "📷 Photo" style label is only a stand-in until the picture is available
-                    let has_text = !m.text.is_empty() && !(m.media_ref.is_some() && is_placeholder(&m.text));
+                    // the "📷 Photo" / "🔗 Link" style label is only a stand-in until the picture or card is available
+                    let has_text = !m.text.is_empty() && !((m.media_ref.is_some() || m.link.is_some()) && is_placeholder(&m.text));
                     let time = hhmm(m.ts);
                     let tick = if mine { if m.pending { " ○" } else { " ✓" } } else { "" };
                     let meta_str = format!("{time}{tick}");
@@ -2139,6 +2354,19 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // a click on a toast: bring the window forward and open that chat
+        if let Some(th) = notify::take_open_request() {
+            match self.hwnd {
+                Some(h) if crate::tray::PARKED.load(std::sync::atomic::Ordering::Relaxed) => crate::tray::show(h),
+                _ => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            }
+            if !th.is_empty() && th != "summary" && self.screen == Screen::Main && self.store.threads.contains_key(&th) {
+                self.handle(Action::Select(th));
+            }
+        }
         self.pump_events();
         self.pump_login();
 
@@ -2215,13 +2443,40 @@ impl eframe::App for App {
             self.paste_down = down;
         }
 
-        // keep the open thread read while the window is focused
+        // keep the open thread read while the window is focused (incl. after refreshThread brings in new messages)
         let focused = ctx.input(|i| i.focused);
         if focused {
             if let Some(th) = self.selected.clone() {
-                if self.store.threads.get(&th).map(|t| t.unread).unwrap_or(false) {
+                let latest_in = self.latest_incoming_id(&th);
+                let new_in_msg = !latest_in.is_empty() && self.last_read_msg_id.get(&th) != Some(&latest_in);
+                let needs_read = self
+                    .store
+                    .threads
+                    .get(&th)
+                    .map(|t| {
+                        t.unread
+                            || (self.store.ready && (t.read_up_to > t.synced_read_up_to + 999.0 || t.last_activity > t.synced_read_up_to + 999.0 || new_in_msg))
+                    })
+                    .unwrap_or(false);
+                if needs_read {
                     self.mark_read(&th);
                 }
+            }
+        }
+
+        // Sync any threads that were already read locally while offline/connecting (or before closing the app)
+        // so Facebook's server watermark catches up and never resurrects them as unread on next start.
+        if self.store.ready && self.backend.is_some() && self.backend_started.elapsed() > Duration::from_secs(5) {
+            let unsynced: Vec<String> = self
+                .store
+                .threads
+                .values()
+                .filter(|t| !t.unread && t.read_up_to > 0.0 && t.read_up_to > t.synced_read_up_to + 999.0)
+                .map(|t| t.id.clone())
+                .take(5)
+                .collect();
+            for th in unsynced {
+                self.mark_read(&th);
             }
         }
 
@@ -2237,7 +2492,7 @@ impl eframe::App for App {
                 let batch = std::mem::take(&mut self.store.notifications);
                 self.pending_since = None;
                 let (t, b, tag) = summarize_notifications(&batch);
-                notify::toast(&t, &b, &tag);
+                notify::toast_for(&t, &b, &tag, &tag);
                 self.last_toast = Instant::now();
             } else {
                 ctx.request_repaint_after(ready_at - Instant::now());

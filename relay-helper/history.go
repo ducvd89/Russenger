@@ -21,6 +21,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waArmadilloBackupMessage"
+	waConsumerApplication "go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	"go.mau.fi/whatsmeow/proto/waMsgApplication"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -81,13 +82,16 @@ func emitHistoryStatus(state, errMsg string, attempts *int) {
 	emit(ev)
 }
 
-// historyStatus tells the app whether history is already restored, needs a PIN, or is unavailable.
-func historyStatus() {
+func hasHistoryDevice() bool {
 	loadHistoryDevice()
 	histMu.Lock()
-	restored := histDevice != nil && histDevice.ID != ""
-	histMu.Unlock()
-	if restored {
+	defer histMu.Unlock()
+	return histDevice != nil && histDevice.ID != ""
+}
+
+// historyStatus tells the app whether history is already restored, needs a PIN, or is unavailable.
+func historyStatus() {
+	if hasHistoryDevice() {
 		emitHistoryStatus("restored", "", nil)
 		return
 	}
@@ -202,11 +206,13 @@ func decodeArchive(chatUser string, bm *waArmadilloBackupMessage.BackupMessage, 
 	if md.GetMessageID() == "" || md.GetSenderID() == "" {
 		return nil, errors.New("archive message without metadata")
 	}
+	chat := e2eeChatJID(chatUser)
 	decoded.Info = types.MessageInfo{
 		MessageSource: types.MessageSource{
-			Chat:     types.NewJID(chatUser, types.MessengerServer),
+			Chat:     chat,
 			Sender:   types.NewJID(md.GetSenderID(), types.MessengerServer),
 			IsFromMe: md.GetSenderID() == selfFBID,
+			IsGroup:  chat.Server == types.GroupServer,
 		},
 		ID:        md.GetMessageID(),
 		Timestamp: time.UnixMilli(tsMs),
@@ -214,29 +220,37 @@ func decodeArchive(chatUser string, bm *waArmadilloBackupMessage.BackupMessage, 
 	return &decoded, nil
 }
 
-// loadEncryptedHistory fetches one page (up to 50 messages) older than `before` (ms).
-func loadEncryptedHistory(thread string, before int64) {
+func fetchEncryptedHistoryPage(thread string, before int64, countLimit int, emitPageEvent bool) (nextBefore int64, hasMore bool, count int) {
 	loadHistoryDevice()
 	histMu.Lock()
 	device := histDevice
 	histMu.Unlock()
 	if device == nil || device.ID == "" {
-		emitHistoryStatus("needPIN", "", nil)
-		return
+		if emitPageEvent {
+			emitHistoryStatus("needPIN", "", nil)
+		}
+		return 0, false, 0
 	}
 	if client == nil {
-		return
+		return 0, false, 0
 	}
 	chatUser := strings.TrimPrefix(thread, "e:")
 	if before <= 0 {
 		before = time.Now().Add(time.Minute).UnixMilli()
 	}
+	if countLimit <= 0 {
+		countLimit = 50
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	page, err := client.GetSecureHistoryClient().FetchMessages(ctx, device, chatUser, true, before, 50)
+	page, err := client.GetSecureHistoryClient().FetchMessages(ctx, device, chatUser, true, before, countLimit)
 	if err != nil {
-		emit(map[string]any{"type": "error", "msg": "history: " + err.Error()})
-		return
+		if emitPageEvent {
+			emit(map[string]any{"type": "error", "msg": "history: " + err.Error()})
+		} else {
+			log.Debug().Err(err).Str("thread", thread).Msg("refreshEncryptedHistory failed")
+		}
+		return 0, false, 0
 	}
 	if page.Epochs != nil && len(page.Epochs.Edges) > 0 {
 		if updated, err := device.WithEpochs(page.Epochs); err == nil {
@@ -249,8 +263,14 @@ func loadEncryptedHistory(thread string, before int64) {
 		}
 	}
 	self, _ := strconv.ParseInt(selfFBID, 10, 64)
-	count := 0
-	for _, m := range page.Decrypt(ctx, device, chatUser, self, false) {
+	isGroup := isE2EEGroup(chatUser)
+
+	type archiveReaction struct {
+		tsMs int64
+		text string
+	}
+
+	for _, m := range page.Decrypt(ctx, device, chatUser, self, isGroup) {
 		if m == nil || m.Message == nil {
 			continue
 		}
@@ -258,52 +278,121 @@ func loadEncryptedHistory(thread string, before int64) {
 		if err != nil || ev == nil {
 			continue
 		}
-		text := fbText(ev)
-		if text == "" && len(m.Attachments) > 0 {
-			text = "[Tệp đính kèm]"
-		}
-		if text == "" {
-			continue
-		}
-		msg := map[string]any{
-			"type": "message", "id": ev.Info.ID, "thread": thread, "sender": ev.Info.Sender.User,
-			"text": text, "ts": float64(ev.Info.Timestamp.UnixMilli()), "live": false, "system": false,
-		}
-		if ev.FBApplication != nil {
-			if q := ev.FBApplication.GetMetadata().GetQuotedMessage(); q != nil && q.GetStanzaID() != "" {
-				msg["replyToId"] = q.GetStanzaID()
+
+		// Apply archived edits and reactions stored in Supplementals.
+		reactions := map[string]archiveReaction{}
+		var latestEdit *waConsumerApplication.ConsumerApplication_EditMessage
+		var editTs int64
+		for _, sup := range m.Supplementals {
+			if sup == nil || sup.Message == nil || sup.Message.GetMetadata() == nil || sup.Message.GetMetadata().TimestampMS == nil {
+				continue
+			}
+			switch sup.Message.GetPayload().(type) {
+			case *waArmadilloBackupMessage.BackupMessage_EncryptedTransportEvent,
+				*waArmadilloBackupMessage.BackupMessage_EncryptedTransportLocallyTransformedMessage,
+				*waArmadilloBackupMessage.BackupMessage_MiTransportAdminMessage:
+				continue
+			}
+			supTs := sup.Message.GetMetadata().GetTimestampMS()
+			supEv, err := decodeArchive(chatUser, sup.Message, supTs)
+			if err != nil || supEv == nil {
+				continue
+			}
+			c := supEv.GetConsumerApplication().GetPayload().GetContent()
+			if rm := c.GetReactionMessage(); rm != nil {
+				actor := supEv.Info.Sender.User
+				prev, ok := reactions[actor]
+				if !ok || supTs > prev.tsMs || (supTs == prev.tsMs && rm.GetText() == "") {
+					reactions[actor] = archiveReaction{tsMs: supTs, text: rm.GetText()}
+				}
+			} else if ed := c.GetEditMessage(); ed != nil && ed.GetMessage() != nil && supEv.Info.Sender == ev.Info.Sender {
+				if latestEdit == nil || supTs > editTs {
+					latestEdit = ed
+					editTs = supTs
+				}
 			}
 		}
-		emit(msg)
-		count++
+		if latestEdit != nil {
+			ev.Message = &waConsumerApplication.ConsumerApplication{
+				Payload: &waConsumerApplication.ConsumerApplication_Payload{
+					Payload: &waConsumerApplication.ConsumerApplication_Payload_Content{
+						Content: &waConsumerApplication.ConsumerApplication_Content{
+							Content: &waConsumerApplication.ConsumerApplication_Content_MessageText{
+								MessageText: latestEdit.GetMessage(),
+							},
+						},
+					},
+				},
+			}
+		}
 
-		// Archived pictures/videos: the CDN path comes from the archive attachments.
+		var paths map[string]string
 		if len(m.Attachments) > 0 {
-			paths := make(map[string]string, len(m.Attachments))
+			paths = make(map[string]string, len(m.Attachments))
 			for _, a := range m.Attachments {
 				if a.ObjectID != "" && a.URL != "" {
 					paths[a.ObjectID] = a.URL
 				}
 			}
-			if kind, dl := mediaDownloader(ev, paths); dl != nil {
-				msgID, th := ev.Info.ID, thread
-				histMediaSem <- struct{}{}
-				go func() {
-					defer func() { <-histMediaSem }()
-					data, ext, err := dl()
-					if err != nil || len(data) == 0 {
-						log.Warn().Err(err).Str("kind", kind).Msg("archive media download failed")
-						return
-					}
-					if p := saveMedia(msgID, ext, data); p != "" {
-						emit(map[string]any{"type": "media", "id": msgID, "thread": th, "kind": kind, "path": p})
-					}
-				}()
+		}
+
+		ext := extractE2EE(ev, paths)
+		if ext.skip {
+			continue
+		}
+		if ext.text == "" && len(m.Attachments) > 0 {
+			ext.text = "📎 Attachment"
+		}
+		if ext.text == "" {
+			continue
+		}
+
+		emitExtractedE2EE(thread, ev.Info.ID, ev.Info.Sender.User, ev.Info.Timestamp.UnixMilli(), false, ext, histMediaSem)
+		for actor, r := range reactions {
+			if r.text != "" && actor != "" {
+				emit(map[string]any{
+					"type": "reaction", "thread": thread,
+					"id": ev.Info.ID, "emoji": r.text, "actor": actor,
+				})
+			}
+		}
+		count++
+	}
+
+	hasMore = page.Range.HasMoreBefore != nil && *page.Range.HasMoreBefore
+	nextBefore = page.Range.Before
+	if emitPageEvent {
+		// If we reached the beginning of E2EE Secure Storage and this chat has a pre-cutover
+		// open thread, pull older plaintext history before closing out pagination.
+		if !hasMore {
+			if openID := getOpenThreadForE2EE(toInt64(chatUser)); openID != 0 {
+				go loadEarlier(thread, "", nextBefore, false)
+			}
+		}
+		emit(map[string]any{"type": "historyPage", "thread": thread, "before": nextBefore, "hasMore": hasMore, "count": count})
+		log.Info().Str("thread", thread).Int("count", count).Bool("hasMore", hasMore).Msg("encrypted history page")
+	}
+	return nextBefore, hasMore, count
+}
+
+// loadEncryptedHistory fetches one page (up to 50 messages) older than `before` (ms).
+func loadEncryptedHistory(thread string, before int64) {
+	fetchEncryptedHistoryPage(thread, before, 50, true)
+}
+
+// refreshEncryptedHistory fetches the newest page(s) of Secure Storage when opening an
+// E2EE conversation (or recovering an undecryptable message) so messages sent/received
+// while this desktop device's offline queue expired still appear seamlessly.
+func refreshEncryptedHistory(thread string, sinceTs int64) {
+	nextBefore, hasMore, _ := fetchEncryptedHistoryPage(thread, 0, 35, false)
+	if sinceTs > 0 {
+		for page := 0; page < 3 && hasMore && nextBefore > sinceTs; page++ {
+			prev := nextBefore
+			nextBefore, hasMore, _ = fetchEncryptedHistoryPage(thread, nextBefore, 50, false)
+			if nextBefore >= prev {
+				break
 			}
 		}
 	}
-	hasMore := page.Range.HasMoreBefore != nil && *page.Range.HasMoreBefore
-	emit(map[string]any{"type": "historyPage", "thread": thread, "before": page.Range.Before, "hasMore": hasMore, "count": count})
-	log.Info().Str("thread", thread).Int("count", count).Bool("hasMore", hasMore).Msg("encrypted history page")
 	_ = fmt.Sprint
 }

@@ -159,10 +159,15 @@ pub fn register_app_id() {
 }
 
 pub fn toast(title: &str, body: &str, tag: &str) {
+    toast_for(title, body, tag, tag)
+}
+
+/// `thread` is what a click on the toast opens ("summary" or empty: just the window).
+pub fn toast_for(title: &str, body: &str, tag: &str, thread: &str) {
     // The text travels in environment variables and is escaped by PowerShell itself, so no
     // character of a message (quotes of any kind included) can ever become script code.
     let body: String = body.chars().take(200).collect();
-    let script = "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;          [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;          $e = { param($s) [System.Security.SecurityElement]::Escape($s) };          $x = New-Object Windows.Data.Xml.Dom.XmlDocument;          $x.LoadXml('<toast><visual><binding template=\"ToastGeneric\"><image placement=\"appLogoOverride\" hint-crop=\"circle\" src=\"' + (& $e $env:RUSSENGER_TOAST_ICON) + '\"/><text>' + (& $e $env:RUSSENGER_TOAST_TITLE) + '</text><text>' + (& $e $env:RUSSENGER_TOAST_BODY) + '</text></binding></visual></toast>');          $t = [Windows.UI.Notifications.ToastNotification]::new($x);          if ($env:RUSSENGER_TOAST_TAG) { $t.Tag = $env:RUSSENGER_TOAST_TAG; $t.Group = 'messages' }; \
+    let script = "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;          [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;          $e = { param($s) [System.Security.SecurityElement]::Escape($s) };          $x = New-Object Windows.Data.Xml.Dom.XmlDocument;          $x.LoadXml('<toast activationType=\"protocol\" launch=\"' + (& $e $env:RUSSENGER_TOAST_LAUNCH) + '\"><visual><binding template=\"ToastGeneric\"><image placement=\"appLogoOverride\" hint-crop=\"circle\" src=\"' + (& $e $env:RUSSENGER_TOAST_ICON) + '\"/><text>' + (& $e $env:RUSSENGER_TOAST_TITLE) + '</text><text>' + (& $e $env:RUSSENGER_TOAST_BODY) + '</text></binding></visual></toast>');          $t = [Windows.UI.Notifications.ToastNotification]::new($x);          if ($env:RUSSENGER_TOAST_TAG) { $t.Tag = $env:RUSSENGER_TOAST_TAG; $t.Group = 'messages' }; \
          [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:RUSSENGER_TOAST_ID).Show($t)";
     let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     let mut cmd = Command::new("powershell.exe");
@@ -170,6 +175,7 @@ pub fn toast(title: &str, body: &str, tag: &str) {
         .env("RUSSENGER_TOAST_TITLE", title)
         .env("RUSSENGER_TOAST_BODY", &body)
         .env("RUSSENGER_TOAST_ID", APP_ID)
+        .env("RUSSENGER_TOAST_LAUNCH", format!("russenger://open?thread={}", url_encode(thread)))
         // a toast with the same tag replaces the earlier one instead of stacking
         .env("RUSSENGER_TOAST_TAG", tag.chars().filter(|c| c.is_ascii_alphanumeric()).take(40).collect::<String>())
         .env("RUSSENGER_TOAST_ICON", format!("file:///{}", icon_path().to_string_lossy().replace('\\', "/")))
@@ -283,4 +289,86 @@ pub fn set_autostart(on: bool) {
         }
         RegCloseKey(key);
     }
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() + 0 + 1 {
+            if let Some(v) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Registers the `russenger:` link scheme for the current user. A click on a toast starts
+/// `russenger.exe "russenger://open?thread=..."`, which hands the thread to the running window.
+pub fn register_protocol() {
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ};
+    let Ok(exe) = std::env::current_exe() else { return };
+    let set = |sub: &str, name: Option<&str>, value: &str| unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let sub = wide(sub);
+        if RegCreateKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, std::ptr::null(), 0, KEY_SET_VALUE, std::ptr::null(), &mut key, std::ptr::null_mut()) != 0 {
+            return;
+        }
+        let n = name.map(wide);
+        let v = wide(value);
+        RegSetValueExW(key, n.as_ref().map(|n| n.as_ptr()).unwrap_or(std::ptr::null()), 0, REG_SZ, v.as_ptr() as *const u8, (v.len() * 2) as u32);
+        RegCloseKey(key);
+    };
+    set("Software\\Classes\\russenger", None, "URL:Russenger");
+    set("Software\\Classes\\russenger", Some("URL Protocol"), "");
+    set("Software\\Classes\\russenger\\shell\\open\\command", None, &format!("\"{}\" \"%1\"", exe.to_string_lossy()));
+}
+
+fn open_request_file() -> std::path::PathBuf {
+    crate::vault::data_dir().join("open-thread.txt")
+}
+
+/// If `arg` is a `russenger://open?thread=...` link, queue the thread for the running window.
+pub fn handle_link_arg(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix("russenger://") else { return false };
+    let thread = rest.split_once("thread=").map(|(_, t)| url_decode(t.trim_end_matches('/'))).unwrap_or_default();
+    let _ = std::fs::write(open_request_file(), thread);
+    true
+}
+
+static OPEN_REQUEST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Background watcher: moves a queued request from the file into memory and wakes the UI.
+pub fn watch_open_requests(ctx: eframe::egui::Context) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let f = open_request_file();
+        if let Ok(t) = std::fs::read_to_string(&f) {
+            let _ = std::fs::remove_file(&f);
+            *OPEN_REQUEST.lock().unwrap() = Some(t.trim().to_string());
+            ctx.request_repaint();
+        }
+    });
+}
+
+pub fn take_open_request() -> Option<String> {
+    OPEN_REQUEST.lock().unwrap().take()
 }

@@ -5,15 +5,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/armadilloutil"
+	waArmadilloApplication "go.mau.fi/whatsmeow/proto/waArmadilloApplication"
+	waArmadilloXMA "go.mau.fi/whatsmeow/proto/waArmadilloXMA"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waConsumerApplication "go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -28,9 +34,19 @@ import (
 )
 
 var (
-	e2eeClient *whatsmeow.Client
-	selfFBID   string
+	e2eeClient      *whatsmeow.Client
+	selfFBID        string
+	e2eeReady       atomic.Bool
+	e2eeOfflineSync atomic.Bool
+	offlineSyncGen  atomic.Uint64
 )
+
+func e2eeChatJID(fbid string) types.JID {
+	if isE2EEGroup(fbid) {
+		return types.JID{User: fbid, Server: types.GroupServer}
+	}
+	return types.JID{User: fbid, Server: types.MessengerServer}
+}
 
 // setupE2EE connects the WhatsApp-protocol encrypted client that carries
 // Messenger's E2EE (personal) chats. Registers a device once and persists it.
@@ -92,15 +108,29 @@ func setupE2EE(ctx context.Context, fbid int64) error {
 			handleReceipt(e)
 		case *events.OfflineSyncPreview: // server is about to replay missed events
 			log.Info().Int("messages", e.Messages).Int("total", e.Total).Msg("E2EE offline sync incoming")
+			if e.Total > 0 || e.Messages > 0 {
+				gen := offlineSyncGen.Add(1)
+				e2eeOfflineSync.Store(true)
+				time.AfterFunc(45*time.Second, func() {
+					if offlineSyncGen.Load() == gen {
+						e2eeOfflineSync.Store(false)
+					}
+				})
+			}
 		case *events.OfflineSyncCompleted:
+			offlineSyncGen.Add(1)
+			e2eeOfflineSync.Store(false)
 			log.Info().Int("count", e.Count).Msg("E2EE offline sync completed")
 		case *events.Connected:
+			e2eeReady.Store(true)
 			log.Info().Msg("E2EE socket connected")
-			// Re-announce availability on every (re)connect — required to receive presence.
 			_ = e2eeClient.SendPresence(context.Background(), types.PresenceAvailable)
+			go flushPendingE2EEReads()
 		case *events.Disconnected:
+			e2eeReady.Store(false)
 			log.Warn().Msg("E2EE socket disconnected (auto-reconnecting)")
 		case *events.LoggedOut:
+			e2eeReady.Store(false)
 			log.Error().Msg("E2EE logged out — session invalid")
 			emit(map[string]any{"type": "error", "msg": "E2EE session expired — re-export cookies"})
 		case *events.CATRefreshError: // auth token couldn't be refreshed in place
@@ -109,6 +139,7 @@ func setupE2EE(ctx context.Context, fbid int64) error {
 		case *events.UndecryptableMessage:
 			log.Warn().Str("chat", e.Info.Chat.User).Bool("unavailable", e.IsUnavailable).
 				Msg("E2EE message failed to decrypt (auto-requesting resend)")
+			handleUndecryptableMessage(e)
 		default:
 			log.Debug().Str("evt", fmt.Sprintf("%T", evt)).Msg("E2EE other event")
 		}
@@ -121,10 +152,42 @@ func setupE2EE(ctx context.Context, fbid int64) error {
 	return nil
 }
 
-// reloadE2EE refreshes the web session (which carries the encrypted client's auth
-// token) and reconnects the encrypted socket — the recovery path when the token can't
-// be refreshed in place, so the channel can't silently rot and start dropping messages.
-// Cooldown-guarded so a burst of errors can't storm reloads.
+func handleUndecryptableMessage(e *events.UndecryptableMessage) {
+	if e == nil || e.DecryptFailMode == events.DecryptFailHide || e.Info.Chat.User == "" || e.Info.ID == "" {
+		return
+	}
+	isGroup := e.Info.Chat.Server == types.GroupServer
+	if isGroup {
+		markE2EEGroup(e.Info.Chat.User)
+		go fetchE2EEGroupInfo(e.Info.Chat)
+	} else if fbid, err := strconv.ParseInt(e.Info.Chat.User, 10, 64); err == nil {
+		markE2EEKey(fbid)
+		go fetchContact(fbid)
+	}
+	thread := "e:" + e.Info.Chat.User
+	sender := e.Info.Sender.User
+	if e.Info.IsFromMe {
+		sender = selfFBID
+	}
+	tsMs := e.Info.Timestamp.UnixMilli()
+	emit(map[string]any{
+		"type":   "message",
+		"id":     e.Info.ID,
+		"thread": thread,
+		"sender": sender,
+		"text":   "🔒 Tin nhắn mã hóa (đang đồng bộ…)",
+		"ts":     float64(tsMs),
+		"live":   false,
+		"system": false,
+	})
+	// Also attempt recovery from Secure Storage after a short delay in case phone resend is offline.
+	if hasHistoryDevice() {
+		time.AfterFunc(4*time.Second, func() {
+			refreshEncryptedHistory(thread, tsMs-5000)
+		})
+	}
+}
+
 var (
 	e2eeReloadMu   sync.Mutex
 	lastE2EEReload time.Time
@@ -153,12 +216,55 @@ func reloadE2EE() {
 var (
 	subscribedPresence   = map[string]bool{}
 	subscribedPresenceMu sync.Mutex
+
+	fetchedGroups   = map[string]bool{}
+	fetchedGroupsMu sync.Mutex
 )
 
-// subscribePresence starts receiving online/last-seen updates for one person.
-// Tolerates being called before the E2EE socket is up (retries until it is).
+func fetchE2EEGroupInfo(jid types.JID) {
+	if jid.User == "" || jid.Server != types.GroupServer {
+		return
+	}
+	fetchedGroupsMu.Lock()
+	if fetchedGroups[jid.User] {
+		fetchedGroupsMu.Unlock()
+		return
+	}
+	fetchedGroups[jid.User] = true
+	fetchedGroupsMu.Unlock()
+
+	for i := 0; i < 6; i++ {
+		if e2eeClient != nil && e2eeReady.Load() {
+			gi, err := e2eeClient.GetGroupInfo(context.Background(), jid)
+			if err == nil && gi != nil {
+				thread := "e:" + jid.User
+				if gi.Name != "" {
+					emit(map[string]any{"type": "thread", "id": thread, "partial": true, "name": gi.Name, "e2ee": true})
+				}
+				for _, p := range gi.Participants {
+					if p.JID.User != "" {
+						emit(map[string]any{
+							"type": "participant", "thread": thread,
+							"contact": p.JID.User, "nickname": "",
+							"admin": p.IsAdmin || p.IsSuperAdmin,
+						})
+						if cid, err := strconv.ParseInt(p.JID.User, 10, 64); err == nil {
+							go fetchContact(cid)
+						}
+					}
+				}
+				return
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	fetchedGroupsMu.Lock()
+	delete(fetchedGroups, jid.User)
+	fetchedGroupsMu.Unlock()
+}
+
 func subscribePresence(fbid string) {
-	if fbid == "" {
+	if fbid == "" || isE2EEGroup(fbid) {
 		return
 	}
 	subscribedPresenceMu.Lock()
@@ -171,7 +277,7 @@ func subscribePresence(fbid string) {
 
 	jid := types.JID{User: fbid, Server: types.MessengerServer}
 	for i := 0; i < 15; i++ {
-		if e2eeClient != nil {
+		if e2eeClient != nil && e2eeReady.Load() {
 			if err := e2eeClient.SubscribePresence(context.Background(), jid); err == nil {
 				return
 			}
@@ -195,32 +301,48 @@ func handlePresence(e *events.Presence) {
 }
 
 func handleChatPresence(e *events.ChatPresence) {
+	if e.Chat.Server == types.GroupServer {
+		markE2EEGroup(e.Chat.User)
+	}
 	emit(map[string]any{
 		"type": "typing", "thread": "e:" + e.Chat.User, "id": e.Sender.User,
 		"composing": e.State == types.ChatPresenceComposing,
 	})
 }
 
-// handleReceipt surfaces delivered/read receipts for our sent encrypted messages as a
-// per-thread watermark timestamp (Messenger shows one "Seen"/"Delivered" under the last).
 func handleReceipt(e *events.Receipt) {
+	if e.Chat.User == "" {
+		return
+	}
+	if e.Chat.Server == types.GroupServer {
+		markE2EEGroup(e.Chat.User)
+	}
+	thread := "e:" + e.Chat.User
+	tsMs := e.Timestamp.UnixMilli()
+
+	// ReceiptTypeReadSelf means WE read this conversation on another device (phone/web).
+	if e.Type == types.ReceiptTypeReadSelf {
+		if tsMs <= 0 {
+			tsMs = time.Now().UnixMilli()
+		}
+		noteThreadWatermark(thread, tsMs, 0)
+		emit(map[string]any{"type": "read", "thread": thread, "readUpTo": tsMs})
+		return
+	}
+
 	var status string
 	switch e.Type {
-	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
+	case types.ReceiptTypeRead:
 		status = "read"
 	case types.ReceiptTypeDelivered:
 		status = "delivered"
 	default:
 		return
 	}
-	if e.Chat.User == "" {
-		return
-	}
 	emit(map[string]any{
-		"type": "receipt", "thread": "e:" + e.Chat.User,
-		"status": status, "ts": float64(e.Timestamp.UnixMilli()),
+		"type": "receipt", "thread": thread,
+		"status": status, "ts": float64(tsMs),
 	})
-	// "seen": the other person read our messages (never our own other-device reads).
 	if e.Type == types.ReceiptTypeRead {
 		reader := e.Sender.User
 		if reader == "" {
@@ -228,35 +350,129 @@ func handleReceipt(e *events.Receipt) {
 		}
 		if reader != selfFBID {
 			emit(map[string]any{
-				"type": "seen", "thread": "e:" + e.Chat.User,
-				"contact": reader, "ts": float64(e.Timestamp.UnixMilli()),
+				"type": "seen", "thread": thread,
+				"contact": reader, "ts": float64(tsMs),
 			})
+		} else if tsMs > 0 {
+			noteThreadWatermark(thread, tsMs, 0)
+			emit(map[string]any{"type": "read", "thread": thread, "readUpTo": tsMs})
 		}
 	}
 }
 
-// markE2EERead tells the server we've read up to a message (so the other side sees "Seen").
-func markE2EERead(fbid, msgID, sender string, tsMs int64) {
-	if e2eeClient == nil || msgID == "" {
-		return
+type pendingE2EERead struct {
+	fbid   string
+	msgIDs []string
+	sender string
+	tsMs   int64
+}
+
+var (
+	pendingReadsMu sync.Mutex
+	pendingReads   []pendingE2EERead
+)
+
+func stripPartSuffix(id string) string {
+	if i := strings.IndexByte(id, '#'); i > 0 {
+		return id[:i]
 	}
-	chat := types.JID{User: fbid, Server: types.MessengerServer}
-	snd := types.JID{User: sender, Server: types.MessengerServer}
+	return id
+}
+
+func cleanMessageIDs(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	seen := map[string]bool{}
+	for _, raw := range ids {
+		id := stripPartSuffix(raw)
+		if id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func doMarkE2EERead(fbid string, msgIDs []string, sender string, tsMs int64) bool {
+	if e2eeClient == nil || !e2eeReady.Load() {
+		return false
+	}
+	cleanIDs := cleanMessageIDs(msgIDs)
+	if len(cleanIDs) == 0 {
+		return true
+	}
+	chat := e2eeChatJID(fbid)
+	// Per WhatsApp multi-device protocol (and mautrix-meta handlematrix.go:597),
+	// `sender` (the `participant` stanza attribute) MUST be EmptyJID in 1:1 DMs
+	// and only populated in @g.us group chats.
+	var snd types.JID
+	if chat.Server == types.GroupServer && sender != "" {
+		snd = types.JID{User: sender, Server: types.MessengerServer}
+	}
 	t := time.UnixMilli(tsMs)
-	if tsMs == 0 {
+	if tsMs <= 0 {
 		t = time.Now()
 	}
-	if err := e2eeClient.MarkRead(context.Background(), []string{msgID}, t, chat, snd); err != nil {
-		log.Debug().Err(err).Msg("E2EE mark read failed")
+	if err := e2eeClient.MarkRead(context.Background(), cleanIDs, t, chat, snd); err != nil {
+		log.Debug().Err(err).Str("chat", fbid).Msg("E2EE mark read failed")
+		return false
+	}
+	return true
+}
+
+func markE2EERead(fbid string, msgIDs []string, sender string, tsMs int64) {
+	cleanIDs := cleanMessageIDs(msgIDs)
+	if fbid == "" || len(cleanIDs) == 0 {
+		return
+	}
+	if doMarkE2EERead(fbid, cleanIDs, sender, tsMs) {
+		return
+	}
+	pendingReadsMu.Lock()
+	defer pendingReadsMu.Unlock()
+	for i := range pendingReads {
+		if pendingReads[i].fbid == fbid {
+			pendingReads[i].msgIDs = cleanMessageIDs(append(pendingReads[i].msgIDs, cleanIDs...))
+			if sender != "" {
+				pendingReads[i].sender = sender
+			}
+			if tsMs > pendingReads[i].tsMs {
+				pendingReads[i].tsMs = tsMs
+			}
+			return
+		}
+	}
+	if len(pendingReads) >= 64 {
+		pendingReads = pendingReads[1:]
+	}
+	pendingReads = append(pendingReads, pendingE2EERead{
+		fbid: fbid, msgIDs: cleanIDs, sender: sender, tsMs: tsMs,
+	})
+}
+
+func flushPendingE2EEReads() {
+	pendingReadsMu.Lock()
+	batch := pendingReads
+	pendingReads = nil
+	pendingReadsMu.Unlock()
+	for _, pr := range batch {
+		if !doMarkE2EERead(pr.fbid, pr.msgIDs, pr.sender, pr.tsMs) {
+			markE2EERead(pr.fbid, pr.msgIDs, pr.sender, pr.tsMs)
+		}
 	}
 }
 
-// sendE2EEReaction adds (emoji) or removes (empty) a reaction on an encrypted message.
+func nextE2EEExtra() whatsmeow.SendRequestExtra {
+	return whatsmeow.SendRequestExtra{
+		ID: strconv.FormatInt(methods.GenerateEpochID(), 10),
+	}
+}
+
 func sendE2EEReaction(fbid, targetMsgID, emoji string, targetFromMe bool) error {
 	if e2eeClient == nil {
 		return fmt.Errorf("E2EE not connected yet")
 	}
-	chat := types.JID{User: fbid, Server: types.MessengerServer}
+	targetMsgID = stripPartSuffix(targetMsgID)
+	chat := e2eeChatJID(fbid)
 	rm := &waConsumerApplication.ConsumerApplication_ReactionMessage{
 		Key: &waCommon.MessageKey{
 			RemoteJID: proto.String(chat.String()),
@@ -275,17 +491,16 @@ func sendE2EEReaction(fbid, targetMsgID, emoji string, targetFromMe bool) error 
 			},
 		},
 	}
-	_, err := e2eeClient.SendFBMessage(context.Background(), chat, app, nil, whatsmeow.SendRequestExtra{})
+	_, err := e2eeClient.SendFBMessage(context.Background(), chat, app, nil, nextE2EEExtra())
 	return err
 }
 
-// sendE2EE sends a text message to an encrypted Messenger thread (optionally a reply).
 func sendE2EE(fbid, text, replyID, replySender, clientTag string) {
 	if e2eeClient == nil {
-		emit(map[string]any{"type": "error", "msg": "E2EE not connected yet"})
+		emit(map[string]any{"type": "sendFailed", "thread": "e:" + fbid, "clientTag": clientTag, "msg": "E2EE not connected yet"})
 		return
 	}
-	jid := types.JID{User: fbid, Server: types.MessengerServer}
+	jid := e2eeChatJID(fbid)
 	msg := &waConsumerApplication.ConsumerApplication{
 		Payload: &waConsumerApplication.ConsumerApplication_Payload{
 			Payload: &waConsumerApplication.ConsumerApplication_Payload_Content{
@@ -299,6 +514,7 @@ func sendE2EE(fbid, text, replyID, replySender, clientTag string) {
 	}
 	var meta *waMsgApplication.MessageApplication_Metadata
 	if replyID != "" {
+		replyID = stripPartSuffix(replyID)
 		sender := replySender
 		if sender == "" {
 			sender = fbid
@@ -310,24 +526,22 @@ func sendE2EE(fbid, text, replyID, replySender, clientTag string) {
 			},
 		}
 	}
-	resp, err := e2eeClient.SendFBMessage(context.Background(), jid, msg, meta, whatsmeow.SendRequestExtra{})
+	resp, err := e2eeClient.SendFBMessage(context.Background(), jid, msg, meta, nextE2EEExtra())
 	if err != nil {
 		log.Warn().Err(err).Msg("E2EE send failed")
 		emit(map[string]any{"type": "sendFailed", "thread": "e:" + fbid, "clientTag": clientTag, "msg": "E2EE send: " + err.Error()})
 		return
 	}
-	// Encrypted sends aren't echoed back to us by the server, so the app shows an
-	// optimistic bubble under a temporary id. Hand back the REAL message id (keyed by
-	// the app's clientTag) so it can swap it in — otherwise incoming reactions/edits,
-	// which target the real id, would never match the bubble.
+	tsMs := resp.Timestamp.UnixMilli()
+	if tsMs <= 0 {
+		tsMs = time.Now().UnixMilli()
+	}
+	noteThreadWatermark("e:"+fbid, tsMs+999, tsMs)
 	if clientTag != "" && resp.ID != "" {
 		emit(map[string]any{"type": "sent", "clientTag": clientTag, "id": resp.ID, "thread": "e:" + fbid})
 	}
 }
 
-// sendE2EEMedia uploads + encrypts any media (picture/video/voice/file) and sends it,
-// built the way the Messenger apps expect (the Thumbnail dimensions are required for
-// images or iOS/Android refuse to display them).
 func sendE2EEMedia(fbid, kind string, data []byte, mime, caption, fileName string, w, h int) error {
 	if e2eeClient == nil {
 		return fmt.Errorf("E2EE not connected yet")
@@ -373,8 +587,14 @@ func sendE2EEMedia(fbid, kind string, data []byte, mime, caption, fileName strin
 		cap = &waCommon.MessageText{Text: proto.String(caption)}
 	}
 	var content waConsumerApplication.ConsumerApplication_Content_Content
+	displayText := caption
+	saveExt := "bin"
 	switch kind {
 	case "video":
+		saveExt = "mp4"
+		if displayText == "" {
+			displayText = "🎬 Video"
+		}
 		m := &waConsumerApplication.ConsumerApplication_VideoMessage{Caption: cap}
 		if err := m.Set(&waMediaTransport.VideoTransport{
 			Integral:  &waMediaTransport.VideoTransport_Integral{Transport: mt},
@@ -384,7 +604,11 @@ func sendE2EEMedia(fbid, kind string, data []byte, mime, caption, fileName strin
 		}
 		content = &waConsumerApplication.ConsumerApplication_Content_VideoMessage{VideoMessage: m}
 	case "audio":
-		ptt := true // treat sent audio as a voice note
+		saveExt = "m4a"
+		if displayText == "" {
+			displayText = "🎤 Voice message"
+		}
+		ptt := true
 		m := &waConsumerApplication.ConsumerApplication_AudioMessage{PTT: &ptt}
 		if err := m.Set(&waMediaTransport.AudioTransport{
 			Integral:  &waMediaTransport.AudioTransport_Integral{Transport: mt},
@@ -394,6 +618,16 @@ func sendE2EEMedia(fbid, kind string, data []byte, mime, caption, fileName strin
 		}
 		content = &waConsumerApplication.ConsumerApplication_Content_AudioMessage{AudioMessage: m}
 	case "file":
+		if i := strings.LastIndex(fileName, "."); i >= 0 && i < len(fileName)-1 {
+			saveExt = fileName[i+1:]
+		}
+		if displayText == "" {
+			if fileName != "" {
+				displayText = "📎 " + fileName
+			} else {
+				displayText = "📎 File"
+			}
+		}
 		fn := fileName
 		m := &waConsumerApplication.ConsumerApplication_DocumentMessage{FileName: &fn}
 		if err := m.Set(&waMediaTransport.DocumentTransport{
@@ -404,6 +638,11 @@ func sendE2EEMedia(fbid, kind string, data []byte, mime, caption, fileName strin
 		}
 		content = &waConsumerApplication.ConsumerApplication_Content_DocumentMessage{DocumentMessage: m}
 	default:
+		kind = "image"
+		saveExt = sniffImageExt(data)
+		if displayText == "" {
+			displayText = "📷 Photo"
+		}
 		m := &waConsumerApplication.ConsumerApplication_ImageMessage{Caption: cap}
 		if err := m.Set(&waMediaTransport.ImageTransport{
 			Integral:  &waMediaTransport.ImageTransport_Integral{Transport: mt},
@@ -420,17 +659,49 @@ func sendE2EEMedia(fbid, kind string, data []byte, mime, caption, fileName strin
 			},
 		},
 	}
-	jid := types.JID{User: fbid, Server: types.MessengerServer}
-	_, err = e2eeClient.SendFBMessage(context.Background(), jid, app, nil, whatsmeow.SendRequestExtra{})
-	return err
+	jid := e2eeChatJID(fbid)
+	resp, err := e2eeClient.SendFBMessage(context.Background(), jid, app, nil, nextE2EEExtra())
+	if err != nil {
+		return err
+	}
+	// Server does NOT echo E2EE sends back to the sending device — emit locally so
+	// sent E2EE photos/videos/files appear immediately and persist in SQLite.
+	msgID := resp.ID
+	if msgID == "" {
+		msgID = strconv.FormatInt(methods.GenerateEpochID(), 10)
+	}
+	tsMs := resp.Timestamp.UnixMilli()
+	if tsMs <= 0 {
+		tsMs = time.Now().UnixMilli()
+	}
+	thread := "e:" + fbid
+	noteThreadWatermark(thread, tsMs+999, tsMs)
+	emit(map[string]any{
+		"type":   "message",
+		"id":     msgID,
+		"thread": thread,
+		"sender": selfFBID,
+		"text":   displayText,
+		"ts":     float64(tsMs),
+		"live":   false,
+		"system": false,
+	})
+	if p := saveMedia(msgID, saveExt, data); p != "" {
+		emit(map[string]any{"type": "media", "id": msgID, "thread": thread, "kind": kind, "path": p})
+	}
+	emit(map[string]any{
+		"type": "thread", "id": thread, "partial": true,
+		"snippet": displayText, "lastActivity": float64(tsMs), "unread": false, "e2ee": true,
+	})
+	return nil
 }
 
-// sendE2EEEdit changes the text of one of our already-sent encrypted messages.
 func sendE2EEEdit(fbid, msgID, text string) error {
 	if e2eeClient == nil {
 		return fmt.Errorf("E2EE not connected yet")
 	}
-	chat := types.JID{User: fbid, Server: types.MessengerServer}
+	msgID = stripPartSuffix(msgID)
+	chat := e2eeChatJID(fbid)
 	em := &waConsumerApplication.ConsumerApplication_EditMessage{
 		Key: &waCommon.MessageKey{
 			RemoteJID: proto.String(chat.String()),
@@ -448,16 +719,16 @@ func sendE2EEEdit(fbid, msgID, text string) error {
 			},
 		},
 	}
-	_, err := e2eeClient.SendFBMessage(context.Background(), chat, app, nil, whatsmeow.SendRequestExtra{})
+	_, err := e2eeClient.SendFBMessage(context.Background(), chat, app, nil, nextE2EEExtra())
 	return err
 }
 
-// sendE2EEUnsend revokes (deletes for everyone) one of our encrypted messages.
 func sendE2EEUnsend(fbid, msgID string) error {
 	if e2eeClient == nil {
 		return fmt.Errorf("E2EE not connected yet")
 	}
-	chat := types.JID{User: fbid, Server: types.MessengerServer}
+	msgID = stripPartSuffix(msgID)
+	chat := e2eeChatJID(fbid)
 	app := &waConsumerApplication.ConsumerApplication{
 		Payload: &waConsumerApplication.ConsumerApplication_Payload{
 			Payload: &waConsumerApplication.ConsumerApplication_Payload_ApplicationData{
@@ -475,7 +746,7 @@ func sendE2EEUnsend(fbid, msgID string) error {
 			},
 		},
 	}
-	_, err := e2eeClient.SendFBMessage(context.Background(), chat, app, nil, whatsmeow.SendRequestExtra{})
+	_, err := e2eeClient.SendFBMessage(context.Background(), chat, app, nil, nextE2EEExtra())
 	return err
 }
 
@@ -486,124 +757,573 @@ func msgText(m *waE2E.Message) string {
 	if t := m.GetConversation(); t != "" {
 		return t
 	}
-	if e := m.GetExtendedTextMessage(); e != nil {
+	if e := m.GetExtendedTextMessage(); e != nil && e.GetText() != "" {
 		return e.GetText()
 	}
-	return ""
-}
-
-// Text (or a typed placeholder) from a Messenger E2EE (armadillo ConsumerApplication)
-// message. Non-text content is rendered as a labelled placeholder so photos, voice
-// notes, stickers etc. never silently vanish from the conversation. Reactions/edits
-// are NOT messages and return "" here (handled separately).
-func fbText(e *events.FBMessage) string {
-	content := e.GetConsumerApplication().GetPayload().GetContent()
-	switch c := content.GetContent().(type) {
-	case *waConsumerApplication.ConsumerApplication_Content_MessageText:
-		return c.MessageText.GetText()
-	case *waConsumerApplication.ConsumerApplication_Content_ExtendedTextMessage:
-		return c.ExtendedTextMessage.GetText().GetText()
-	case *waConsumerApplication.ConsumerApplication_Content_ImageMessage:
+	if im := m.GetImageMessage(); im != nil {
+		if im.GetCaption() != "" {
+			return im.GetCaption()
+		}
 		return "📷 Photo"
-	case *waConsumerApplication.ConsumerApplication_Content_VideoMessage:
+	}
+	if vm := m.GetVideoMessage(); vm != nil {
+		if vm.GetCaption() != "" {
+			return vm.GetCaption()
+		}
 		return "🎬 Video"
-	case *waConsumerApplication.ConsumerApplication_Content_AudioMessage:
-		return "🎤 Voice message"
-	case *waConsumerApplication.ConsumerApplication_Content_StickerMessage:
-		return "💟 Sticker"
-	case *waConsumerApplication.ConsumerApplication_Content_DocumentMessage:
+	}
+	if dm := m.GetDocumentMessage(); dm != nil {
+		if dm.GetCaption() != "" {
+			return dm.GetCaption()
+		}
+		if dm.GetFileName() != "" {
+			return "📎 " + dm.GetFileName()
+		}
 		return "📎 File"
-	case *waConsumerApplication.ConsumerApplication_Content_LocationMessage,
-		*waConsumerApplication.ConsumerApplication_Content_LiveLocationMessage:
-		return "📍 Location"
-	case *waConsumerApplication.ConsumerApplication_Content_ContactMessage,
-		*waConsumerApplication.ConsumerApplication_Content_ContactsArrayMessage:
-		return "👤 Contact"
+	}
+	if m.GetAudioMessage() != nil {
+		return "🎤 Voice message"
+	}
+	if m.GetStickerMessage() != nil {
+		return "💟 Sticker"
 	}
 	return ""
 }
 
-// mediaDownloader returns a kind label + a function that downloads & decrypts the
-// media for an encrypted message, if it carries any. nil func = no media.
-func mediaDownloader(e *events.FBMessage, pathOverrides ...map[string]string) (kind string, dl func() ([]byte, string, error)) {
-	// Archived (secure-history) messages carry the CDN path separately, keyed by object id.
-	integ := func(tr *waMediaTransport.WAMediaTransport) *waMediaTransport.WAMediaTransport_Integral {
-		in := tr.GetIntegral()
-		if len(pathOverrides) > 0 && in != nil {
-			if path := pathOverrides[0][tr.GetAncillary().GetObjectID()]; path != "" {
-				in = proto.CloneOf(in)
-				in.DirectPath = proto.String(path)
-			}
-		}
-		return in
+type e2eeMediaPart struct {
+	kind  string
+	label string
+	dl    func() ([]byte, string, error)
+}
+
+type e2eeLinkCard struct {
+	title    string
+	subtitle string
+	url      string
+	thumbDL  func() ([]byte, string, error)
+}
+
+type extractedE2EE struct {
+	text       string
+	replyToID  string
+	replyToUsr string
+	link       *e2eeLinkCard
+	media      []e2eeMediaPart
+	skip       bool
+}
+
+func overrideTransportIntegral(tr *waMediaTransport.WAMediaTransport, pathOverrides []map[string]string) *waMediaTransport.WAMediaTransport_Integral {
+	if tr == nil {
+		return nil
 	}
-	content := e.GetConsumerApplication().GetPayload().GetContent()
-	switch c := content.GetContent().(type) {
-	case *waConsumerApplication.ConsumerApplication_Content_ImageMessage:
-		return "image", func() ([]byte, string, error) {
-			t, err := c.ImageMessage.Decode()
-			if err != nil {
-				return nil, "", err
-			}
-			data, err := e2eeClient.DownloadFB(context.Background(), integ(t.GetIntegral().GetTransport()), whatsmeow.MediaImage)
-			return data, "jpg", err
+	in := tr.GetIntegral()
+	if len(pathOverrides) > 0 && pathOverrides[0] != nil && in != nil {
+		if path := pathOverrides[0][tr.GetAncillary().GetObjectID()]; path != "" {
+			in = proto.CloneOf(in)
+			in.DirectPath = proto.String(path)
 		}
-	case *waConsumerApplication.ConsumerApplication_Content_StickerMessage:
-		return "sticker", func() ([]byte, string, error) {
-			t, err := c.StickerMessage.Decode()
-			if err != nil {
-				return nil, "", err
-			}
-			// Facebook library stickers: no encrypted blob, fetched via ReceiverFetch.
-			if rfID := t.GetAncillary().GetReceiverFetchID(); rfID != "" {
-				data, err := fetchReceiverFetchSticker(rfID)
+	}
+	return in
+}
+
+func extractConsumerContent(rawContent *waConsumerApplication.ConsumerApplication_Content, pathOverrides []map[string]string) extractedE2EE {
+	var out extractedE2EE
+	if rawContent == nil {
+		return out
+	}
+	switch c := rawContent.GetContent().(type) {
+	case *waConsumerApplication.ConsumerApplication_Content_MessageText:
+		out.text = c.MessageText.GetText()
+	case *waConsumerApplication.ConsumerApplication_Content_ExtendedTextMessage:
+		out.text = c.ExtendedTextMessage.GetText().GetText()
+	case *waConsumerApplication.ConsumerApplication_Content_ImageMessage:
+		out.text = c.ImageMessage.GetCaption().GetText()
+		if out.text == "" {
+			out.text = "📷 Photo"
+		}
+		imgMsg := c.ImageMessage
+		out.media = append(out.media, e2eeMediaPart{
+			kind: "image", label: "📷 Photo",
+			dl: func() ([]byte, string, error) {
+				t, err := imgMsg.Decode()
 				if err != nil {
-					log.Error().Err(err).Msg("E2EE receiver-fetch sticker failed")
 					return nil, "", err
 				}
+				data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(t.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaImage)
+				if err != nil {
+					return nil, "jpg", err
+				}
 				return data, sniffImageExt(data), nil
-			}
-			data, err := e2eeClient.DownloadFB(context.Background(), integ(t.GetIntegral().GetTransport()), whatsmeow.MediaImage)
-			if err != nil {
-				return data, "webp", err
-			}
-			return data, sniffImageExt(data), nil
-		}
+			},
+		})
 	case *waConsumerApplication.ConsumerApplication_Content_VideoMessage:
-		return "video", func() ([]byte, string, error) {
-			t, err := c.VideoMessage.Decode()
-			if err != nil {
-				return nil, "", err
-			}
-			data, err := e2eeClient.DownloadFB(context.Background(), integ(t.GetIntegral().GetTransport()), whatsmeow.MediaVideo)
-			return data, "mp4", err
+		out.text = c.VideoMessage.GetCaption().GetText()
+		if out.text == "" {
+			out.text = "🎬 Video"
 		}
+		vidMsg := c.VideoMessage
+		out.media = append(out.media, e2eeMediaPart{
+			kind: "video", label: "🎬 Video",
+			dl: func() ([]byte, string, error) {
+				t, err := vidMsg.Decode()
+				if err != nil {
+					return nil, "", err
+				}
+				data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(t.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaVideo)
+				return data, "mp4", err
+			},
+		})
 	case *waConsumerApplication.ConsumerApplication_Content_AudioMessage:
-		return "audio", func() ([]byte, string, error) {
-			t, err := c.AudioMessage.Decode()
-			if err != nil {
-				return nil, "", err
-			}
-			data, err := e2eeClient.DownloadFB(context.Background(), integ(t.GetIntegral().GetTransport()), whatsmeow.MediaAudio)
-			return data, "m4a", err
-		}
+		out.text = "🎤 Voice message"
+		audMsg := c.AudioMessage
+		out.media = append(out.media, e2eeMediaPart{
+			kind: "audio", label: "🎤 Voice message",
+			dl: func() ([]byte, string, error) {
+				t, err := audMsg.Decode()
+				if err != nil {
+					return nil, "", err
+				}
+				data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(t.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaAudio)
+				return data, "m4a", err
+			},
+		})
+	case *waConsumerApplication.ConsumerApplication_Content_StickerMessage:
+		out.text = "💟 Sticker"
+		stkMsg := c.StickerMessage
+		out.media = append(out.media, e2eeMediaPart{
+			kind: "sticker", label: "💟 Sticker",
+			dl: func() ([]byte, string, error) {
+				t, err := stkMsg.Decode()
+				if err != nil {
+					return nil, "", err
+				}
+				if rfID := t.GetAncillary().GetReceiverFetchID(); rfID != "" {
+					data, err := fetchReceiverFetchSticker(rfID)
+					if err != nil {
+						return nil, "", err
+					}
+					return data, sniffImageExt(data), nil
+				}
+				data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(t.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaImage)
+				if err != nil {
+					return data, "webp", err
+				}
+				return data, sniffImageExt(data), nil
+			},
+		})
 	case *waConsumerApplication.ConsumerApplication_Content_DocumentMessage:
-		return "file", func() ([]byte, string, error) {
-			t, err := c.DocumentMessage.Decode()
-			if err != nil {
-				return nil, "", err
-			}
-			data, err := e2eeClient.DownloadFB(context.Background(), integ(t.GetIntegral().GetTransport()), whatsmeow.MediaDocument)
-			ext := "bin"
-			if fn := c.DocumentMessage.GetFileName(); fn != "" {
+		fn := c.DocumentMessage.GetFileName()
+		label := "📎 File"
+		if fn != "" {
+			label = "📎 " + fn
+		}
+		out.text = label
+		docMsg := c.DocumentMessage
+		out.media = append(out.media, e2eeMediaPart{
+			kind: "file", label: label,
+			dl: func() ([]byte, string, error) {
+				t, err := docMsg.Decode()
+				if err != nil {
+					return nil, "", err
+				}
+				data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(t.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaDocument)
+				ext := "bin"
 				if i := strings.LastIndex(fn, "."); i >= 0 && i < len(fn)-1 {
 					ext = fn[i+1:]
 				}
+				return data, ext, err
+			},
+		})
+	case *waConsumerApplication.ConsumerApplication_Content_ViewOnceMessage:
+		switch vo := c.ViewOnceMessage.GetViewOnceContent().(type) {
+		case *waConsumerApplication.ConsumerApplication_ViewOnceMessage_ImageMessage:
+			out.text = vo.ImageMessage.GetCaption().GetText()
+			if out.text == "" {
+				out.text = "📷 Photo"
 			}
-			return data, ext, err
+			imgMsg := vo.ImageMessage
+			out.media = append(out.media, e2eeMediaPart{
+				kind: "image", label: "📷 Photo",
+				dl: func() ([]byte, string, error) {
+					t, err := imgMsg.Decode()
+					if err != nil {
+						return nil, "", err
+					}
+					data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(t.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaImage)
+					if err != nil {
+						return nil, "jpg", err
+					}
+					return data, sniffImageExt(data), nil
+				},
+			})
+		case *waConsumerApplication.ConsumerApplication_ViewOnceMessage_VideoMessage:
+			out.text = vo.VideoMessage.GetCaption().GetText()
+			if out.text == "" {
+				out.text = "🎬 Video"
+			}
+			vidMsg := vo.VideoMessage
+			out.media = append(out.media, e2eeMediaPart{
+				kind: "video", label: "🎬 Video",
+				dl: func() ([]byte, string, error) {
+					t, err := vidMsg.Decode()
+					if err != nil {
+						return nil, "", err
+					}
+					data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(t.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaVideo)
+					return data, "mp4", err
+				},
+			})
+		default:
+			out.text = "📷 Tin nhắn xem 1 lần"
+		}
+	case *waConsumerApplication.ConsumerApplication_Content_LocationMessage:
+		loc := c.LocationMessage
+		parts := []string{}
+		if n := loc.GetLocation().GetName(); n != "" {
+			parts = append(parts, n)
+		}
+		if a := loc.GetAddress(); a != "" {
+			parts = append(parts, a)
+		}
+		if len(parts) > 0 {
+			out.text = "📍 " + strings.Join(parts, " — ")
+		} else {
+			out.text = "📍 Location"
+		}
+	case *waConsumerApplication.ConsumerApplication_Content_LiveLocationMessage:
+		out.text = "📍 Live location"
+	case *waConsumerApplication.ConsumerApplication_Content_ContactMessage,
+		*waConsumerApplication.ConsumerApplication_Content_ContactsArrayMessage:
+		out.text = "👤 Contact"
+	case *waConsumerApplication.ConsumerApplication_Content_PollCreationMessage:
+		p := c.PollCreationMessage
+		var sb strings.Builder
+		sb.WriteString("📊 ")
+		if p.GetName() != "" {
+			sb.WriteString(p.GetName())
+		} else {
+			sb.WriteString("Bình chọn")
+		}
+		for _, opt := range p.GetOptions() {
+			if on := opt.GetOptionName(); on != "" {
+				sb.WriteString("\n• ")
+				sb.WriteString(on)
+			}
+		}
+		out.text = sb.String()
+	case *waConsumerApplication.ConsumerApplication_Content_PollUpdateMessage,
+		*waConsumerApplication.ConsumerApplication_Content_ReactionMessage,
+		*waConsumerApplication.ConsumerApplication_Content_EditMessage:
+		out.skip = true
+	}
+	return out
+}
+
+func extractArmadilloRaven(rm *waArmadilloApplication.Armadillo_Content_RavenMessage, pathOverrides []map[string]string) extractedE2EE {
+	var out extractedE2EE
+	if rm == nil {
+		return out
+	}
+	switch rm.GetMediaContent().(type) {
+	case *waArmadilloApplication.Armadillo_Content_RavenMessage_ImageMessage:
+		out.text = "📷 Photo"
+		out.media = append(out.media, e2eeMediaPart{
+			kind: "image", label: "📷 Photo",
+			dl: func() ([]byte, string, error) {
+				img, err := rm.DecodeImageMessage()
+				if err != nil {
+					return nil, "", err
+				}
+				data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(img.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaImage)
+				if err != nil {
+					return nil, "jpg", err
+				}
+				return data, sniffImageExt(data), nil
+			},
+		})
+	case *waArmadilloApplication.Armadillo_Content_RavenMessage_VideoMessage:
+		out.text = "🎬 Video"
+		out.media = append(out.media, e2eeMediaPart{
+			kind: "video", label: "🎬 Video",
+			dl: func() ([]byte, string, error) {
+				vid, err := rm.DecodeVideoMessage()
+				if err != nil {
+					return nil, "", err
+				}
+				data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(vid.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaVideo)
+				return data, "mp4", err
+			},
+		})
+	default:
+		out.text = "📷 Tin nhắn xem 1 lần"
+	}
+	return out
+}
+
+func extractArmadilloExtended(xma *waArmadilloXMA.ExtendedContentMessage, pathOverrides []map[string]string) extractedE2EE {
+	var out extractedE2EE
+	if xma == nil {
+		return out
+	}
+	var linkURL string
+	for _, cta := range xma.GetCtas() {
+		for _, cand := range []string{cta.GetNativeURL(), cta.GetActionURL()} {
+			if cand == "" {
+				continue
+			}
+			if parsed, err := neturl.Parse(cand); err == nil {
+				if parsed.Scheme == "messenger" && parsed.Host == "location_share" {
+					lbl := strings.TrimSpace(xma.GetTitleText() + " " + xma.GetSubtitleText())
+					if lbl == "" {
+						lbl = "Location"
+					}
+					out.text = "📍 " + lbl
+					return out
+				}
+				if (parsed.Scheme == "https" || parsed.Scheme == "http") && parsed.Host != "" && linkURL == "" {
+					linkURL = unwrapLPHP(cand)
+				}
+			}
 		}
 	}
-	return "", nil
+
+	if xma.GetTargetType() == waArmadilloXMA.ExtendedContentMessage_FB_STORY_REPLY && xma.AssociatedMessage != nil {
+		var assocMsg waMsgApplication.MessageApplication
+		if _, err := armadilloutil.Unmarshal(&assocMsg, xma.AssociatedMessage, 2); err == nil {
+			var consMsg waConsumerApplication.ConsumerApplication
+			if _, err := armadilloutil.Unmarshal(&consMsg, assocMsg.GetPayload().GetSubProtocol().GetConsumerMessage(), 1); err == nil {
+				inner := extractConsumerContent(consMsg.GetPayload().GetContent(), pathOverrides)
+				if inner.text != "" {
+					inner.text = "↪ Story: " + inner.text
+					return inner
+				}
+			}
+		}
+	}
+
+	var thumbDL func() ([]byte, string, error)
+	for _, rawPrev := range xma.GetPreviews() {
+		imgTr, err := armadilloutil.Unmarshal(&waMediaTransport.ImageTransport{}, rawPrev, 2)
+		if err != nil || imgTr == nil {
+			continue
+		}
+		tr := imgTr.GetIntegral().GetTransport()
+		in := overrideTransportIntegral(tr, pathOverrides)
+		if in == nil || in.GetDirectPath() == "" {
+			continue
+		}
+		inCopy := in
+		thumbDL = func() ([]byte, string, error) {
+			data, err := e2eeClient.DownloadFB(context.Background(), inCopy, whatsmeow.MediaImage)
+			if err != nil {
+				return nil, "jpg", err
+			}
+			return data, sniffImageExt(data), nil
+		}
+		break
+	}
+
+	title := strings.TrimSpace(xma.GetTitleText())
+	subtitle := strings.TrimSpace(xma.GetSubtitleText())
+	if title != "" || subtitle != "" || linkURL != "" || thumbDL != nil {
+		out.link = &e2eeLinkCard{
+			title:    title,
+			subtitle: subtitle,
+			url:      linkURL,
+			thumbDL:  thumbDL,
+		}
+	}
+	out.text = strings.TrimSpace(xma.GetMessageText())
+	if out.text == "" {
+		if out.link != nil {
+			out.text = "🔗 Link"
+		} else if title != "" {
+			out.text = title
+		} else if subtitle != "" {
+			out.text = subtitle
+		} else {
+			out.text = "🔗 Nội dung được chia sẻ"
+		}
+	}
+	return out
+}
+
+// extractE2EE decodes both ConsumerApplication AND Armadillo E2EE payloads (links,
+// URL previews, shared reels/posts/stories, multi-photo galleries, view-once media,
+// polls, captions, bumped messages) so no E2EE message type is silently dropped.
+func extractE2EE(e *events.FBMessage, pathOverrides ...map[string]string) extractedE2EE {
+	var out extractedE2EE
+	if e == nil {
+		out.skip = true
+		return out
+	}
+
+	switch typed := e.Message.(type) {
+	case *waConsumerApplication.ConsumerApplication:
+		if typed.GetPayload().GetApplicationData().GetRevoke() != nil {
+			out.skip = true
+			return out
+		}
+		out = extractConsumerContent(typed.GetPayload().GetContent(), pathOverrides)
+	case *waArmadilloApplication.Armadillo:
+		if e.Info.IsFromMe {
+			if ms := typed.GetPayload().GetApplicationData().GetMetadataSync(); ms != nil {
+				for _, action := range ms.GetActions() {
+					ca := action.GetChatAction()
+					if ca != nil && ca.GetChatDelete() != nil {
+						raw := strings.SplitN(ca.GetChatID(), "@", 2)[0]
+						if raw != "" {
+							emit(map[string]any{"type": "deleteThread", "thread": "e:" + raw})
+						}
+					}
+				}
+				out.skip = true
+				return out
+			}
+		}
+		ac := typed.GetPayload().GetContent()
+		if ac == nil || ac.GetRavenActionNotifMessage() != nil {
+			out.skip = true
+			return out
+		}
+		switch content := ac.GetContent().(type) {
+		case *waArmadilloApplication.Armadillo_Content_ExtendedContentMessage:
+			out = extractArmadilloExtended(content.ExtendedContentMessage, pathOverrides)
+		case *waArmadilloApplication.Armadillo_Content_BumpExistingMessage_:
+			out.text = "↪ Đã nhắc lại tin nhắn"
+			if k := content.BumpExistingMessage.GetKey(); k != nil {
+				out.replyToID = k.GetID()
+				if p := k.GetParticipant(); p != "" {
+					out.replyToUsr = strings.SplitN(p, "@", 2)[0]
+				}
+			}
+		case *waArmadilloApplication.Armadillo_Content_RavenMessage_:
+			out = extractArmadilloRaven(content.RavenMessage, pathOverrides)
+		case *waArmadilloApplication.Armadillo_Content_RavenMessageMsgr:
+			out = extractArmadilloRaven(content.RavenMessageMsgr, pathOverrides)
+		case *waArmadilloApplication.Armadillo_Content_ImageGalleryMessage_:
+			out.text = "📷 Photo"
+			if imgs, err := content.ImageGalleryMessage.Decode(); err == nil {
+				for _, img := range imgs {
+					imgTr := img
+					out.media = append(out.media, e2eeMediaPart{
+						kind: "image", label: "📷 Photo",
+						dl: func() ([]byte, string, error) {
+							data, err := e2eeClient.DownloadFB(context.Background(), overrideTransportIntegral(imgTr.GetIntegral().GetTransport(), pathOverrides), whatsmeow.MediaImage)
+							if err != nil {
+								return nil, "jpg", err
+							}
+							return data, sniffImageExt(data), nil
+						},
+					})
+				}
+			}
+		default:
+			out.text = "📎 Tin nhắn đa phương tiện"
+		}
+	default:
+		if e.Message == nil {
+			out.skip = true
+			return out
+		}
+		out.text = "📎 Tin nhắn"
+	}
+
+	if e.FBApplication != nil {
+		if q := e.FBApplication.GetMetadata().GetQuotedMessage(); q != nil {
+			if sid := q.GetStanzaID(); sid != "" {
+				out.replyToID = sid
+				if p := q.GetParticipant(); p != "" {
+					out.replyToUsr = strings.SplitN(p, "@", 2)[0]
+				}
+			}
+		}
+	}
+	return out
+}
+
+func emitExtractedE2EE(thread, baseID, sender string, tsMs int64, live bool, ext extractedE2EE, sem chan struct{}) {
+	if baseID == "" || ext.text == "" {
+		return
+	}
+	msgEv := map[string]any{
+		"type": "message", "id": baseID, "thread": thread, "sender": sender,
+		"text": ext.text, "ts": float64(tsMs), "live": live, "system": false,
+	}
+	if ext.replyToID != "" {
+		msgEv["replyToId"] = ext.replyToID
+		if ext.replyToUsr != "" {
+			msgEv["replyToSender"] = ext.replyToUsr
+		}
+	}
+	emit(msgEv)
+
+	if ext.link != nil {
+		lc := ext.link
+		emit(map[string]any{
+			"type": "link", "id": baseID, "thread": thread,
+			"title": lc.title, "subtitle": lc.subtitle, "description": "",
+			"source": "", "url": lc.url, "image": "",
+		})
+		if lc.thumbDL != nil {
+			dl := lc.thumbDL
+			go func() {
+				if sem != nil {
+					sem <- struct{}{}
+					defer func() { <-sem }()
+				}
+				if e2eeClient == nil {
+					return
+				}
+				data, fileExt, err := dl()
+				if err != nil || len(data) == 0 {
+					return
+				}
+				if p := saveMedia(baseID+"_preview", fileExt, data); p != "" {
+					emit(map[string]any{
+						"type": "link", "id": baseID, "thread": thread,
+						"title": lc.title, "subtitle": lc.subtitle, "description": "",
+						"source": "", "url": lc.url, "image": p,
+					})
+				}
+			}()
+		}
+	}
+
+	for i, mp := range ext.media {
+		partID := baseID
+		if i > 0 {
+			partID = fmt.Sprintf("%s#%d", baseID, i)
+			lbl := mp.label
+			if lbl == "" {
+				lbl = "📷 Photo"
+			}
+			emit(map[string]any{
+				"type": "message", "id": partID, "thread": thread, "sender": sender,
+				"text": lbl, "ts": float64(tsMs) + float64(i)*0.001, "live": false, "system": false,
+			})
+		}
+		if mp.dl != nil {
+			kind, dl, pid, th := mp.kind, mp.dl, partID, thread
+			go func() {
+				if sem != nil {
+					sem <- struct{}{}
+					defer func() { <-sem }()
+				}
+				if e2eeClient == nil {
+					return
+				}
+				data, fileExt, err := dl()
+				if err != nil || len(data) == 0 {
+					log.Warn().Err(err).Str("kind", kind).Msg("media download failed")
+					return
+				}
+				if p := saveMedia(pid, fileExt, data); p != "" {
+					emit(map[string]any{"type": "media", "id": pid, "thread": th, "kind": kind, "path": p})
+				}
+			}()
+		}
+	}
 }
 
 // fetchReceiverFetchSticker downloads a Facebook-library sticker via messagix.
@@ -635,7 +1355,6 @@ func fetchReceiverFetchSticker(id string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 20<<20))
 }
 
-// sniffImageExt picks a file extension from magic bytes (default webp).
 func sniffImageExt(b []byte) string {
 	switch {
 	case len(b) >= 8 && string(b[:8]) == "\x89PNG\r\n\x1a\n":
@@ -650,12 +1369,11 @@ func sniffImageExt(b []byte) string {
 	return "webp"
 }
 
-// saveMedia writes downloaded media to the app's media cache and returns its path.
 func saveMedia(id, ext string, data []byte) string {
 	dir, _ := os.UserConfigDir()
 	mdir := filepath.Join(dir, "Relay", "media")
 	_ = os.MkdirAll(mdir, 0o700)
-	safe := strings.NewReplacer("/", "_", ":", "_", "$", "_", ".", "_").Replace(id)
+	safe := strings.NewReplacer("/", "_", ":", "_", "$", "_", ".", "_", "#", "_").Replace(id)
 	p := filepath.Join(mdir, safe+"."+ext)
 	if err := os.WriteFile(p, data, 0o600); err != nil {
 		log.Warn().Err(err).Msg("save media failed")
@@ -668,19 +1386,29 @@ func handleFBMessage(e *events.FBMessage) {
 	if e.Info.Chat.User == "" {
 		return
 	}
+	isGroup := e.Info.Chat.Server == types.GroupServer
+	if isGroup {
+		markE2EEGroup(e.Info.Chat.User)
+	}
+	thread := "e:" + e.Info.Chat.User
+
 	// Unsend / delete: the partner (or you, from another device) removed a message.
 	if rev := e.GetConsumerApplication().GetPayload().GetApplicationData().GetRevoke(); rev != nil {
 		if id := rev.GetKey().GetID(); id != "" {
-			emit(map[string]any{"type": "delete", "thread": "e:" + e.Info.Chat.User, "id": id})
+			emit(map[string]any{"type": "delete", "thread": thread, "id": id})
 		}
 		return
 	}
 	// Reaction add (emoji) / remove (empty) on one of our (or their) messages.
 	if c, ok := e.GetConsumerApplication().GetPayload().GetContent().GetContent().(*waConsumerApplication.ConsumerApplication_Content_ReactionMessage); ok {
 		rm := c.ReactionMessage
+		actor := e.Info.Sender.User
+		if e.Info.IsFromMe {
+			actor = selfFBID
+		}
 		emit(map[string]any{
-			"type": "reaction", "thread": "e:" + e.Info.Chat.User,
-			"id": rm.GetKey().GetID(), "emoji": rm.GetText(), "actor": e.Info.Sender.User,
+			"type": "reaction", "thread": thread,
+			"id": rm.GetKey().GetID(), "emoji": rm.GetText(), "actor": actor,
 		})
 		return
 	}
@@ -688,70 +1416,69 @@ func handleFBMessage(e *events.FBMessage) {
 	if c, ok := e.GetConsumerApplication().GetPayload().GetContent().GetContent().(*waConsumerApplication.ConsumerApplication_Content_EditMessage); ok {
 		if id := c.EditMessage.GetKey().GetID(); id != "" {
 			emit(map[string]any{
-				"type": "edit", "thread": "e:" + e.Info.Chat.User,
+				"type": "edit", "thread": thread,
 				"id": id, "text": c.EditMessage.GetMessage().GetText(),
 			})
 		}
 		return
 	}
-	text := fbText(e)
-	if text == "" {
+
+	ext := extractE2EE(e)
+	if ext.skip || ext.text == "" {
 		return
 	}
-	thread := "e:" + e.Info.Chat.User // namespaced so E2EE rows never collide with non-E2EE
+
 	sender := e.Info.Sender.User
-	ts := float64(e.Info.Timestamp.UnixMilli())
-	isGroup := e.Info.Chat.Server == types.GroupServer
+	if e.Info.IsFromMe {
+		sender = selfFBID
+	}
+	tsMs := e.Info.Timestamp.UnixMilli()
+	ts := float64(tsMs)
 
 	name := ""
 	if !isGroup && !e.Info.IsFromMe && e.Info.PushName != "" && e.Info.PushName != "username" {
 		name = e.Info.PushName
 	}
-	// Resolve the partner's real name + avatar — encrypted contacts are never in
-	// the normal sync, so this is the only way their chat gets a name and picture.
 	if !isGroup {
 		if fbid, err := strconv.ParseInt(e.Info.Chat.User, 10, 64); err == nil {
 			go fetchContact(fbid)
-			markE2EEKey(fbid) // backfill for this chat should merge into the encrypted thread
+			markE2EEKey(fbid)
 		}
 		go subscribePresence(e.Info.Chat.User)
-	}
-	emit(map[string]any{
-		"type": "thread", "id": thread, "contact": e.Info.Chat.User, "name": name,
-		"snippet": text, "lastActivity": ts, "unread": !e.Info.IsFromMe, "e2ee": true,
-	})
-	msgEv := map[string]any{
-		"type": "message", "id": e.Info.ID, "thread": thread, "sender": sender,
-		"text": text, "ts": ts, "live": true, "system": false,
-	}
-	// Reply: carry the quoted message's id + author (the app fills in the quoted
-	// text from its local copy). The quote lives in the message-application metadata.
-	if e.FBApplication != nil {
-		if q := e.FBApplication.GetMetadata().GetQuotedMessage(); q != nil {
-			if sid := q.GetStanzaID(); sid != "" {
-				msgEv["replyToId"] = sid
-				if p := q.GetParticipant(); p != "" {
-					msgEv["replyToSender"] = strings.SplitN(p, "@", 2)[0]
-				}
+	} else {
+		if gid, err := strconv.ParseInt(e.Info.Chat.User, 10, 64); err == nil {
+			markE2EEKey(gid)
+		}
+		go fetchE2EEGroupInfo(e.Info.Chat)
+		if !e.Info.IsFromMe && sender != "" {
+			if sid, err := strconv.ParseInt(sender, 10, 64); err == nil {
+				go fetchContact(sid)
 			}
 		}
 	}
-	emit(msgEv)
 
-	// Download + decrypt any picture/sticker so it renders inline (not just as text).
-	if kind, dl := mediaDownloader(e); dl != nil {
-		msgID, th := e.Info.ID, thread
-		go func() {
-			data, ext, err := dl()
-			if err != nil || len(data) == 0 {
-				log.Warn().Err(err).Str("kind", kind).Msg("media download failed")
-				return
-			}
-			if p := saveMedia(msgID, ext, data); p != "" {
-				emit(map[string]any{"type": "media", "id": msgID, "thread": th, "kind": kind, "path": p})
-			}
-		}()
+	isLive := !e2eeOfflineSync.Load()
+	if e.Info.IsFromMe {
+		noteThreadWatermark(thread, tsMs+999, tsMs)
+	} else {
+		noteThreadWatermark(thread, 0, tsMs)
 	}
+	wm := getThreadWatermark(thread)
+	unread := !e.Info.IsFromMe && !(wm.readUpTo > 0 && tsMs <= wm.readUpTo+999)
+
+	thEv := map[string]any{
+		"type": "thread", "id": thread, "name": name,
+		"snippet": ext.text, "lastActivity": ts, "unread": unread, "e2ee": true,
+	}
+	if wm.readUpTo > 0 {
+		thEv["readUpTo"] = wm.readUpTo
+	}
+	if !isGroup {
+		thEv["contact"] = e.Info.Chat.User
+	}
+	emit(thEv)
+
+	emitExtractedE2EE(thread, e.Info.ID, sender, tsMs, isLive, ext, nil)
 }
 
 // Backfill: the phone sends recent encrypted history when a device registers.
@@ -767,6 +1494,11 @@ func handleHistorySync(e *events.HistorySync) {
 		}
 		thread := "e:" + raw
 		isGroup := strings.Contains(jid, "@g.us")
+		if isGroup {
+			markE2EEGroup(raw)
+		} else if fbid, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			markE2EEKey(fbid)
+		}
 		var name, lastText string
 		var lastTs float64
 		for _, hm := range conv.GetMessages() {
@@ -796,10 +1528,14 @@ func handleHistorySync(e *events.HistorySync) {
 			lastText, lastTs = text, ts
 		}
 		if lastText != "" {
-			emit(map[string]any{
-				"type": "thread", "id": thread, "contact": raw, "name": name,
+			thEv := map[string]any{
+				"type": "thread", "id": thread, "name": name,
 				"snippet": lastText, "lastActivity": lastTs, "unread": false, "e2ee": true,
-			})
+			}
+			if !isGroup {
+				thEv["contact"] = raw
+			}
+			emit(thEv)
 		}
 	}
 }

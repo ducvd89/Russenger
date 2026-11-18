@@ -166,7 +166,8 @@ func main() {
 		case "refreshThread":
 			// App opened a thread — pull anything newer than what it has.
 			if thread, _ := m["thread"].(string); thread != "" {
-				go refreshThread(thread)
+				sinceTs := toInt64(m["sinceTs"])
+				go refreshThread(thread, sinceTs)
 			}
 		case "react":
 			thread, _ := m["thread"].(string)
@@ -194,8 +195,16 @@ func main() {
 			id, _ := m["id"].(string)
 			sender, _ := m["sender"].(string)
 			ts := toInt64(m["ts"])
+			var ids []string
+			if arr, ok := m["ids"].([]any); ok {
+				for _, v := range arr {
+					if s, ok := v.(string); ok && s != "" {
+						ids = append(ids, s)
+					}
+				}
+			}
 			if thread != "" {
-				go markReadServer(thread, id, sender, ts)
+				go markReadServer(thread, id, ids, sender, ts)
 			}
 		case "mute":
 			thread, _ := m["thread"].(string)
@@ -305,10 +314,11 @@ func connect(cookieStr string) error {
 			emit(map[string]any{"type": "error", "msg": "connection: " + e.Err.Error()})
 			os.Exit(1)
 		case *table.LSTable:
-			if n := len(e.LSDeleteThenInsertThread); n > 0 {
+			if n := len(e.LSDeleteThenInsertThread) + len(e.LSUpdateOrInsertThread); n > 0 {
 				threadRowsSeen.Add(int64(n))
 			}
 			processTable(e, !threadBackfill.Load())
+			client.PostHandlePublishResponse(e)
 		}
 	})
 
@@ -339,22 +349,204 @@ func connect(cookieStr string) error {
 	return nil
 }
 
-// Thread keys we know are encrypted (E2EE 1:1). Backfill for these comes back on the
-// normal publish stream with the RAW key, but the UI tracks them as "e:<key>", so we
-// re-namespace their messages/threads to merge with the live encrypted thread.
-var e2eeKeys sync.Map // int64 → true
+// Thread metadata & E2EE / Hybrid mapping state.
+// Meta serves E2EE chats in both WhatsApp/Armadillo ("e:<jid>") and Lightspeed metadata
+// tables (SyncGroup 95 / 1, sometimes under a separate hybrid fbKey mapped to ThreadJID).
+// Tracking these mappings ensures threads and messages never split across two IDs and read
+// watermarks are updated on both transports.
+type watermark struct {
+	readUpTo     int64
+	lastActivity int64
+}
+
+var (
+	metaMu            sync.Mutex
+	e2eeKeys          = map[int64]bool{}
+	e2eeGroups        = map[string]bool{}
+	hybridFBToJID     = map[int64]int64{}
+	hybridJIDToFB     = map[int64]int64{}
+	cutoverOpenToE2EE = map[int64]int64{}
+	cutoverE2EEToOpen = map[int64]int64{}
+	threadSyncGroup   = map[int64]int64{}
+	threadTypes       = map[int64]table.ThreadType{}
+	threadWatermarks  = map[string]watermark{}
+	attachLabels      = map[string]string{}
+
+	rangeMu      sync.Mutex
+	rangeChanged = make(chan struct{})
+	lastMsgRange = map[int64]*table.LSInsertNewMessageRange{}
+	rangeGen     = map[int64]uint64{}
+)
 
 func markE2EEKey(tid int64) {
 	if tid != 0 {
-		e2eeKeys.Store(tid, true)
+		metaMu.Lock()
+		e2eeKeys[tid] = true
+		metaMu.Unlock()
 	}
 }
-func isE2EEKey(tid int64) bool { _, ok := e2eeKeys.Load(tid); return ok }
-func emitThreadID(tid int64) string {
-	if isE2EEKey(tid) {
-		return "e:" + fmtID(tid)
+
+func isE2EEKey(tid int64) bool {
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	return e2eeKeys[tid] || threadTypes[tid].IsWhatsApp()
+}
+
+func markE2EEGroup(user string) {
+	if user != "" {
+		metaMu.Lock()
+		e2eeGroups[user] = true
+		metaMu.Unlock()
 	}
-	return fmtID(tid)
+}
+
+func isE2EEGroup(user string) bool {
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	return e2eeGroups[user]
+}
+
+func resolveThreadLocked(raw int64) (emitID string, jid int64, encrypted bool) {
+	jid = raw
+	if m := hybridFBToJID[raw]; m != 0 {
+		jid = m
+	} else if m := cutoverOpenToE2EE[raw]; m != 0 {
+		jid = m
+	}
+	encrypted = e2eeKeys[jid] || e2eeKeys[raw] || threadTypes[jid].IsWhatsApp() || threadTypes[raw].IsWhatsApp()
+	if encrypted {
+		return "e:" + fmtID(jid), jid, true
+	}
+	return fmtID(jid), jid, false
+}
+
+func emitThreadID(tid int64) string {
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	id, _, _ := resolveThreadLocked(tid)
+	return id
+}
+
+func noteThreadWatermark(threadID string, readUpTo, lastActivity int64) {
+	if threadID == "" {
+		return
+	}
+	metaMu.Lock()
+	wm := threadWatermarks[threadID]
+	if readUpTo > wm.readUpTo {
+		wm.readUpTo = readUpTo
+	}
+	if lastActivity > wm.lastActivity {
+		wm.lastActivity = lastActivity
+	}
+	threadWatermarks[threadID] = wm
+	metaMu.Unlock()
+}
+
+func getThreadWatermark(threadID string) watermark {
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	return threadWatermarks[threadID]
+}
+
+func syncGroupFor(tid int64) int64 {
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	if tt := threadTypes[tid]; tt >= 18 && tt <= 26 {
+		return 104
+	}
+	if sg := threadSyncGroup[tid]; sg > 0 {
+		return sg
+	}
+	return 1
+}
+
+func cursorDBFor(sg int64) int64 {
+	switch sg {
+	case 95, 104:
+		return sg
+	default:
+		return 1
+	}
+}
+
+func getHybridFBKey(jid int64) int64 {
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	return hybridJIDToFB[jid]
+}
+
+func getOpenThreadForE2EE(jid int64) int64 {
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	return cutoverE2EEToOpen[jid]
+}
+
+func setAttachLabel(msgID, label string) {
+	if msgID == "" || label == "" {
+		return
+	}
+	metaMu.Lock()
+	if len(attachLabels) > 10000 {
+		attachLabels = map[string]string{}
+	}
+	attachLabels[msgID] = label
+	metaMu.Unlock()
+}
+
+func getAttachLabel(msgID string) string {
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	return attachLabels[msgID]
+}
+
+func noteMessageRange(rng *table.LSInsertNewMessageRange) {
+	if rng == nil || rng.ThreadKey == 0 {
+		return
+	}
+	rangeMu.Lock()
+	lastMsgRange[rng.ThreadKey] = rng
+	rangeGen[rng.ThreadKey]++
+	close(rangeChanged)
+	rangeChanged = make(chan struct{})
+	rangeMu.Unlock()
+}
+
+func getLastRange(tid int64) (*table.LSInsertNewMessageRange, uint64) {
+	rangeMu.Lock()
+	defer rangeMu.Unlock()
+	return lastMsgRange[tid], rangeGen[tid]
+}
+
+func waitForRangeUpdate(tid int64, prevGen uint64, timeout time.Duration) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		rangeMu.Lock()
+		gen, ch := rangeGen[tid], rangeChanged
+		rangeMu.Unlock()
+		if gen > prevGen {
+			return
+		}
+		select {
+		case <-ch:
+		case <-deadline.C:
+			return
+		}
+	}
+}
+
+func runTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	if client == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	_ = client.WaitUntilCanSendMessages(ctx, 15*time.Second)
+	tbl, err := client.ExecuteTasks(ctx, tasks...)
+	if err == nil && tbl != nil {
+		processTable(tbl, false)
+		client.PostHandlePublishResponse(tbl)
+	}
+	return tbl, err
 }
 
 // normalizeFolder maps Meta's many folder names (incl. the "e2ee_cutover_*"
@@ -458,7 +650,169 @@ func blobMedia(t table.AttachmentType, mime, playable, preview string) (kind, ur
 	return kind, url
 }
 
+type basicMsgMeta struct {
+	thread int64
+	sender int64
+	ts     int64
+}
+
+var (
+	msgMetaMu    sync.Mutex
+	knownMsgMeta = map[string]basicMsgMeta{}
+)
+
+func putMsgMeta(id string, m basicMsgMeta) {
+	if id == "" {
+		return
+	}
+	msgMetaMu.Lock()
+	if len(knownMsgMeta) > 10000 {
+		knownMsgMeta = map[string]basicMsgMeta{}
+	}
+	knownMsgMeta[id] = m
+	msgMetaMu.Unlock()
+}
+
+func getMsgMeta(id string) (basicMsgMeta, bool) {
+	msgMetaMu.Lock()
+	defer msgMetaMu.Unlock()
+	m, ok := knownMsgMeta[id]
+	return m, ok
+}
+
+func recordThreadMetaLocked(key int64, tt table.ThreadType, sg int64, folder string) {
+	if key == 0 {
+		return
+	}
+	jid := key
+	if m := hybridFBToJID[key]; m != 0 {
+		jid = m
+	} else if m := cutoverOpenToE2EE[key]; m != 0 {
+		jid = m
+	}
+	if tt != 0 {
+		threadTypes[key] = tt
+		threadTypes[jid] = tt
+	}
+	if tt >= 18 && tt <= 26 {
+		threadSyncGroup[key] = 104
+	} else if sg > 0 {
+		threadSyncGroup[key] = sg
+	}
+	if tt.IsWhatsApp() || strings.Contains(folder, "e2ee_cutover") {
+		e2eeKeys[jid] = true
+		if tt == table.ENCRYPTED_OVER_WA_GROUP {
+			e2eeGroups[fmtID(jid)] = true
+		}
+	}
+}
+
 func processTable(tbl *table.LSTable, live bool) {
+	if tbl == nil {
+		return
+	}
+	now := time.Now().UnixMilli()
+
+	// 1. Pre-pass: record thread authority, hybrid FB↔JID mappings, cutover links,
+	// SyncGroup assignments, and message pagination ranges BEFORE emitting any thread
+	// or message events so every ID resolves to its canonical "e:<jid>" or "<fbid>".
+	activeThreads := map[int64]bool{}
+	var pendingMerges [][2]string
+
+	metaMu.Lock()
+	for _, c := range tbl.LSCreateOpenToE2EEThreadLink {
+		if c.ArmadilloThreadID != 0 {
+			e2eeKeys[c.ArmadilloThreadID] = true
+			if c.OpenThreadID != 0 {
+				cutoverOpenToE2EE[c.OpenThreadID] = c.ArmadilloThreadID
+				cutoverE2EEToOpen[c.ArmadilloThreadID] = c.OpenThreadID
+				if c.OpenThreadID != c.ArmadilloThreadID {
+					pendingMerges = append(pendingMerges, [2]string{fmtID(c.OpenThreadID), "e:" + fmtID(c.ArmadilloThreadID)})
+				} else {
+					pendingMerges = append(pendingMerges, [2]string{fmtID(c.OpenThreadID), "e:" + fmtID(c.ArmadilloThreadID)})
+				}
+			}
+		}
+	}
+	for _, j := range tbl.LSUpdateThreadAuthorityAndMappingWithOTIDFromJID {
+		if j.ThreadJID != 0 {
+			e2eeKeys[j.ThreadJID] = true
+			activeThreads[j.ThreadJID] = true
+			if j.ThreadKey != 0 {
+				hybridFBToJID[j.ThreadKey] = j.ThreadJID
+				hybridJIDToFB[j.ThreadJID] = j.ThreadKey
+				threadSyncGroup[j.ThreadKey] = 95
+				pendingMerges = append(pendingMerges, [2]string{fmtID(j.ThreadKey), "e:" + fmtID(j.ThreadJID)})
+			}
+		}
+	}
+	var hybridReads [][2]any
+	for _, j := range tbl.LSVerifyHybridThreadExists {
+		if j.ThreadJID != 0 {
+			e2eeKeys[j.ThreadJID] = true
+			activeThreads[j.ThreadJID] = true
+			if j.ThreadType != 0 {
+				threadTypes[j.ThreadJID] = j.ThreadType
+			}
+			if j.IsGroupThread || j.ThreadType == table.ENCRYPTED_OVER_WA_GROUP {
+				e2eeGroups[fmtID(j.ThreadJID)] = true
+			}
+			if j.ThreadKey != 0 {
+				hybridFBToJID[j.ThreadKey] = j.ThreadJID
+				hybridJIDToFB[j.ThreadJID] = j.ThreadKey
+				threadSyncGroup[j.ThreadKey] = 95
+				activeThreads[j.ThreadKey] = true
+				pendingMerges = append(pendingMerges, [2]string{fmtID(j.ThreadKey), "e:" + fmtID(j.ThreadJID)})
+			}
+			thID := "e:" + fmtID(j.ThreadJID)
+			wm := threadWatermarks[thID]
+			if j.LastReadWatermarkTimestampMS > wm.readUpTo {
+				wm.readUpTo = j.LastReadWatermarkTimestampMS
+			}
+			if j.LastActivityTimestampMS > wm.lastActivity {
+				wm.lastActivity = j.LastActivityTimestampMS
+			}
+			threadWatermarks[thID] = wm
+			if j.LastReadWatermarkTimestampMS > 0 && j.LastReadWatermarkTimestampMS >= j.LastActivityTimestampMS {
+				hybridReads = append(hybridReads, [2]any{thID, j.LastReadWatermarkTimestampMS})
+			}
+		}
+	}
+	for _, mv := range tbl.LSMoveThreadToE2EECutoverFolder {
+		if mv.ThreadKey != 0 {
+			_, jid, _ := resolveThreadLocked(mv.ThreadKey)
+			e2eeKeys[jid] = true
+			pendingMerges = append(pendingMerges, [2]string{fmtID(mv.ThreadKey), "e:" + fmtID(jid)})
+		}
+	}
+	for _, v := range tbl.LSVerifyThreadExists {
+		activeThreads[v.ThreadKey] = true
+		recordThreadMetaLocked(v.ThreadKey, v.ThreadType, v.SyncGroup, v.FolderName)
+	}
+	for _, th := range tbl.LSDeleteThenInsertThread {
+		activeThreads[th.ThreadKey] = true
+		recordThreadMetaLocked(th.ThreadKey, th.ThreadType, th.SyncGroup, th.FolderName)
+	}
+	for _, th := range tbl.LSUpdateOrInsertThread {
+		activeThreads[th.ThreadKey] = true
+		recordThreadMetaLocked(th.ThreadKey, th.ThreadType, th.SyncGroup, th.FolderName)
+	}
+	metaMu.Unlock()
+
+	for _, rng := range tbl.LSInsertNewMessageRange {
+		activeThreads[rng.ThreadKey] = true
+		noteMessageRange(rng)
+	}
+	for _, mg := range pendingMerges {
+		if mg[0] != "" && mg[1] != "" && mg[0] != mg[1] {
+			emit(map[string]any{"type": "mergeThread", "from": mg[0], "to": mg[1]})
+		}
+	}
+	for _, hr := range hybridReads {
+		emit(map[string]any{"type": "read", "thread": hr[0], "readUpTo": hr[1]})
+	}
+
+	// 2. Contacts, participants, presence.
 	emitContact := func(id int64, name, first, avatar string) {
 		if id == 0 {
 			return
@@ -468,31 +822,25 @@ func processTable(tbl *table.LSTable, live bool) {
 			"firstName": first, "avatar": avatar,
 		})
 	}
-	// Contact info arrives via either struct depending on the sync.
 	for _, ct := range tbl.LSDeleteThenInsertContact {
 		emitContact(ct.Id, ct.Name, ct.FirstName, ct.ProfilePictureUrl)
 	}
 	for _, ct := range tbl.LSVerifyContactRowExists {
 		emitContact(ct.ContactId, ct.Name, ct.FirstName, ct.ProfilePictureUrl)
 	}
-	// Thread → participant links, so the app can name/illustrate 1:1 threads.
 	for _, p := range tbl.LSAddParticipantIdToGroupThread {
 		emit(map[string]any{
-			"type": "participant", "thread": fmtID(p.ThreadKey),
+			"type": "participant", "thread": emitThreadID(p.ThreadKey),
 			"contact": fmtID(p.ContactId), "nickname": p.Nickname,
 			"admin": p.IsAdmin || p.IsSuperAdmin,
 		})
 	}
-	// Admin promotions/demotions.
 	for _, a := range tbl.LSUpdateThreadParticipantAdminStatus {
 		emit(map[string]any{
-			"type": "admin", "thread": fmtID(a.ThreadKey),
+			"type": "admin", "thread": emitThreadID(a.ThreadKey),
 			"contact": fmtID(a.ContactId), "admin": a.IsAdmin,
 		})
 	}
-	// Online / last-seen — Messenger active status comes through the Lightspeed channel
-	// (NOT whatsmeow presence). Someone is "active now" while their status hasn't expired.
-	now := time.Now().UnixMilli()
 	for _, p := range tbl.LSDeleteThenInsertContactPresence {
 		if p.ContactId == 0 {
 			continue
@@ -507,36 +855,63 @@ func processTable(tbl *table.LSTable, live bool) {
 		}
 		emit(ev)
 	}
-	// Unsend / delete in regular chats — remove the message from the UI.
+
+	// 3. Message deletes, edits, reactions, typing, read receipts & thread read watermarks.
 	for _, d := range tbl.LSDeleteMessage {
 		if d.MessageId != "" {
 			emit(map[string]any{"type": "delete", "thread": emitThreadID(d.ThreadKey), "id": d.MessageId})
 		}
 	}
-	// Edited messages — update the text in place.
 	for _, ed := range tbl.LSEditMessage {
 		if ed.MessageID != "" {
 			emit(map[string]any{"type": "edit", "id": ed.MessageID, "text": ed.Text})
 		}
 	}
-	// Read receipts (regular chats) — per-thread "read up to" watermark.
-	for _, r := range tbl.LSUpdateReadReceipt {
-		emit(map[string]any{
-			"type": "receipt", "thread": emitThreadID(r.ThreadKey),
-			"status": "read", "ts": float64(r.ReadWatermarkTimestampMs),
-		})
-		if reader := fmtID(r.ContactId); r.ContactId != 0 && reader != selfFBID {
-			ts := r.ReadActionTimestampMs
-			if ts == 0 {
-				ts = r.ReadWatermarkTimestampMs
-			}
-			emit(map[string]any{
-				"type": "seen", "thread": emitThreadID(r.ThreadKey),
-				"contact": reader, "ts": float64(ts),
-			})
+	for _, mr := range tbl.LSMarkThreadRead {
+		if mr.ThreadKey != 0 && mr.LastReadWatermarkTimestampMs > 0 {
+			thID := emitThreadID(mr.ThreadKey)
+			noteThreadWatermark(thID, mr.LastReadWatermarkTimestampMs, 0)
+			emit(map[string]any{"type": "read", "thread": thID, "readUpTo": mr.LastReadWatermarkTimestampMs})
 		}
 	}
-	// Reactions (regular chats): upsert = add/change, delete = remove.
+	for _, mr := range tbl.LSMarkThreadReadV2 {
+		if mr.ThreadKey != 0 && mr.LastReadWatermarkTimestampMs > 0 {
+			thID := emitThreadID(mr.ThreadKey)
+			noteThreadWatermark(thID, mr.LastReadWatermarkTimestampMs, 0)
+			emit(map[string]any{"type": "read", "thread": thID, "readUpTo": mr.LastReadWatermarkTimestampMs})
+		}
+	}
+	for _, b := range tbl.LSBumpThread {
+		if b.ThreadKey != 0 && b.LastReadWatermarkTimestampMs > 0 &&
+			(b.BumpStatus == table.ACTIVITY_AND_READ || b.BumpStatus == table.ACTIVITY_AND_READ_2) {
+			thID := emitThreadID(b.ThreadKey)
+			noteThreadWatermark(thID, b.LastReadWatermarkTimestampMs, 0)
+			emit(map[string]any{"type": "read", "thread": thID, "readUpTo": b.LastReadWatermarkTimestampMs})
+		}
+	}
+	for _, r := range tbl.LSUpdateReadReceipt {
+		thID := emitThreadID(r.ThreadKey)
+		reader := fmtID(r.ContactId)
+		if r.ContactId == 0 || reader == selfFBID {
+			if r.ReadWatermarkTimestampMs > 0 {
+				noteThreadWatermark(thID, r.ReadWatermarkTimestampMs, 0)
+				emit(map[string]any{"type": "read", "thread": thID, "readUpTo": r.ReadWatermarkTimestampMs})
+			}
+			continue
+		}
+		emit(map[string]any{
+			"type": "receipt", "thread": thID,
+			"status": "read", "ts": float64(r.ReadWatermarkTimestampMs),
+		})
+		ts := r.ReadActionTimestampMs
+		if ts == 0 {
+			ts = r.ReadWatermarkTimestampMs
+		}
+		emit(map[string]any{
+			"type": "seen", "thread": thID,
+			"contact": reader, "ts": float64(ts),
+		})
+	}
 	for _, r := range tbl.LSUpsertReaction {
 		emit(map[string]any{
 			"type": "reaction", "thread": emitThreadID(r.ThreadKey),
@@ -549,14 +924,14 @@ func processTable(tbl *table.LSTable, live bool) {
 			"id": r.MessageId, "emoji": "", "actor": fmtID(r.ActorId),
 		})
 	}
-	// Typing indicator for regular (non-E2EE) threads. (E2EE typing comes via whatsmeow.)
 	for _, ti := range tbl.LSUpdateTypingIndicator {
 		emit(map[string]any{
 			"type": "typing", "thread": emitThreadID(ti.ThreadKey),
 			"id": fmtID(ti.SenderId), "composing": ti.IsTyping,
 		})
 	}
-	// Community folders (name + picture); their channels point at them through ParentThreadKey.
+
+	// 4. Community folders, full thread rows, partial thread metadata updates, and thread deletions.
 	for _, c := range tbl.LSPopulateCommunityFolderData {
 		if c.ThreadKey <= 0 || c.Name == "" {
 			continue
@@ -575,57 +950,203 @@ func processTable(tbl *table.LSTable, live bool) {
 			"picture": f.ThreadPictureURL, "lastActivity": f.LastActivityTimestampMS,
 		})
 	}
-	for _, th := range tbl.LSDeleteThenInsertThread {
+
+	emitThreadRow := func(rawKey int64, name, snippet, pic, picFallback, folderName string, lastAct, readWm, muteExp, parentKey int64, ttype table.ThreadType) {
+		if rawKey == 0 {
+			return
+		}
+		metaMu.Lock()
+		id, jid, encrypted := resolveThreadLocked(rawKey)
+		isGrp := e2eeGroups[fmtID(jid)] || ttype == table.ENCRYPTED_OVER_WA_GROUP || ttype == table.GROUP_THREAD
+		metaMu.Unlock()
+
+		noteThreadWatermark(id, readWm, lastAct)
+		if pic == "" {
+			pic = picFallback
+		}
+		folder := normalizeFolder(folderName)
 		ev := map[string]any{
-			"type": "thread", "id": emitThreadID(th.ThreadKey), "name": th.ThreadName,
-			"snippet": th.Snippet, "picture": th.ThreadPictureUrl,
-			"lastActivity": th.LastActivityTimestampMs,
-			"unread":       th.LastActivityTimestampMs > th.LastReadWatermarkTimestampMs,
-			"readUpTo":     th.LastReadWatermarkTimestampMs,
-			"folder":       normalizeFolder(th.FolderName),
-			// thread kind (5 = marketplace, 17-21 = community folder/channels) and its parent
-			"ttype":  int64(th.ThreadType),
-			"parent": fmtID(th.ParentThreadKey),
-			// MuteExpireTimeMs: 0 = not muted; -1 (or far future) = muted.
-			"muted": th.MuteExpireTimeMs != 0 && (th.MuteExpireTimeMs < 0 || th.MuteExpireTimeMs > now),
+			"type":         "thread",
+			"id":           id,
+			"name":         name,
+			"snippet":      snippet,
+			"picture":      pic,
+			"lastActivity": lastAct,
+			"unread":       lastAct > readWm,
+			"readUpTo":     readWm,
+			"folder":       folder,
+			"ttype":        int64(ttype),
+			"parent":       fmtID(parentKey),
+			"muted":        muteExp != 0 && (muteExp < 0 || muteExp > now),
+			"e2ee":         encrypted,
 		}
-		if isE2EEKey(th.ThreadKey) {
-			ev["contact"] = fmtID(th.ThreadKey) // keep contact lookup pointed at the raw fbid
+		if encrypted {
+			if !isGrp {
+				ev["contact"] = fmtID(jid)
+			}
+			if rawPlain := fmtID(rawKey); rawPlain != id {
+				ev["mergeFrom"] = rawPlain
+			}
 		}
-		noteOldestThread(th.ThreadKey, th.LastActivityTimestampMs, th.ParentThreadKey, normalizeFolder(th.FolderName))
+		noteOldestThread(rawKey, lastAct, parentKey, folder)
 		emit(ev)
 	}
-	// Attachments arrive as separate rows; their message row has empty text and would
-	// otherwise be dropped. Map each to a labelled placeholder so nothing vanishes.
-	attachLabel := map[string]string{}
-	for _, a := range tbl.LSInsertAttachment {
-		if a.MessageId != "" {
-			attachLabel[a.MessageId] = attachTypeLabel(a.AttachmentType)
+
+	seenFullThread := map[int64]bool{}
+	for _, th := range tbl.LSDeleteThenInsertThread {
+		seenFullThread[th.ThreadKey] = true
+		emitThreadRow(
+			th.ThreadKey, th.ThreadName, th.Snippet, th.ThreadPictureUrl, th.ThreadPictureUrlFallback,
+			th.FolderName, th.LastActivityTimestampMs, th.LastReadWatermarkTimestampMs,
+			th.MuteExpireTimeMs, th.ParentThreadKey, th.ThreadType,
+		)
+	}
+	for _, th := range tbl.LSUpdateOrInsertThread {
+		if seenFullThread[th.ThreadKey] {
+			continue
+		}
+		emitThreadRow(
+			th.ThreadKey, th.ThreadName, th.Snippet, th.ThreadPictureUrl, th.ThreadPictureUrlFallback,
+			th.FolderName, th.LastActivityTimestampMs, th.LastReadWatermarkTimestampMs,
+			th.MuteExpireTimeMs, th.ParentThreadKey, th.ThreadType,
+		)
+	}
+	for _, u := range tbl.LSSyncUpdateThreadName {
+		name := u.ThreadName
+		if name == "" {
+			name = u.ThreadName1
+		}
+		if u.ThreadKey != 0 && name != "" {
+			emit(map[string]any{"type": "thread", "id": emitThreadID(u.ThreadKey), "partial": true, "name": name})
 		}
 	}
+	for _, u := range tbl.LSSetThreadImageURL {
+		pic := u.ImageURL
+		if pic == "" {
+			pic = u.ImageFallbackURL
+		}
+		if u.ThreadKey != 0 && pic != "" {
+			emit(map[string]any{"type": "thread", "id": emitThreadID(u.ThreadKey), "partial": true, "picture": pic})
+		}
+	}
+	for _, u := range tbl.LSUpdateThreadMuteSetting {
+		if u.ThreadKey != 0 {
+			muted := u.MuteExpireTimeMS != 0 && (u.MuteExpireTimeMS < 0 || u.MuteExpireTimeMS > now)
+			emit(map[string]any{"type": "thread", "id": emitThreadID(u.ThreadKey), "partial": true, "muted": muted})
+		}
+	}
+	for _, u := range tbl.LSMoveThreadToArchivedFolder {
+		if u.ThreadKey != 0 {
+			emit(map[string]any{"type": "thread", "id": emitThreadID(u.ThreadKey), "partial": true, "folder": "archived"})
+		}
+	}
+	for _, u := range tbl.LSMoveThreadToInboxAndUpdateParent {
+		if u.ThreadKey != 0 {
+			emit(map[string]any{"type": "thread", "id": emitThreadID(u.ThreadKey), "partial": true, "folder": "inbox", "parent": fmtID(u.ParentThreadKey)})
+		}
+	}
+	emitDeleteThread := func(rawKey int64) {
+		if rawKey == 0 || activeThreads[rawKey] {
+			return
+		}
+		metaMu.Lock()
+		id, jid, _ := resolveThreadLocked(rawKey)
+		metaMu.Unlock()
+		if activeThreads[jid] {
+			return
+		}
+		emit(map[string]any{"type": "deleteThread", "thread": id})
+	}
+	for _, d := range tbl.LSDeleteThread {
+		emitDeleteThread(d.ThreadKey)
+	}
+	for _, d := range tbl.LSDeletePartialThread {
+		emitDeleteThread(d.ThreadKey)
+	}
+
+	// 5. Index messages first so multi-attachment items (2nd, 3rd photo/file in the same
+	// message) can synthesize distinct "#1", "#2" message rows instead of overwriting.
+	for _, m := range tbl.LSInsertMessage {
+		if !m.IsUnsent && m.MessageId != "" {
+			putMsgMeta(m.MessageId, basicMsgMeta{thread: m.ThreadKey, sender: m.SenderId, ts: m.TimestampMs})
+		}
+	}
+	for _, m := range tbl.LSUpsertMessage {
+		if !m.IsUnsent && m.MessageId != "" {
+			putMsgMeta(m.MessageId, basicMsgMeta{thread: m.ThreadKey, sender: m.SenderId, ts: m.TimestampMs})
+		}
+	}
+	for _, m := range tbl.LSDeleteThenInsertMessage {
+		if !m.IsUnsent && m.MessageId != "" {
+			putMsgMeta(m.MessageId, basicMsgMeta{thread: m.ThreadKey, sender: m.SenderId, ts: m.TimestampMs})
+		}
+	}
+
 	for _, a := range tbl.LSInsertStickerAttachment {
 		if a.MessageId != "" {
-			attachLabel[a.MessageId] = "💟 Sticker"
-		}
-	}
-	// Current Messenger delivers photos/videos/files as "blob" attachments and shared items as XMA.
-	for _, a := range tbl.LSInsertBlobAttachment {
-		if a.MessageId != "" {
-			attachLabel[a.MessageId] = blobLabel(a.AttachmentType, a.AttachmentMimeType)
+			setAttachLabel(a.MessageId, "💟 Sticker")
 		}
 	}
 	for _, a := range tbl.LSInsertXmaAttachment {
-		if a.MessageId != "" {
-			if _, ok := attachLabel[a.MessageId]; !ok {
-				attachLabel[a.MessageId] = "🔗 Link"
+		if a.MessageId != "" && getAttachLabel(a.MessageId) == "" {
+			setAttachLabel(a.MessageId, "🔗 Link")
+		}
+	}
+
+	mediaCount := map[string]int{}
+	seenAttachFbid := map[string]bool{}
+	emitAttachmentPart := func(msgID, fbid string, threadKey int64, kind, url, label string) {
+		if msgID == "" {
+			return
+		}
+		if fbid != "" {
+			dedupKey := msgID + "|" + fbid
+			if seenAttachFbid[dedupKey] {
+				return
+			}
+			seenAttachFbid[dedupKey] = true
+		}
+		idx := mediaCount[msgID]
+		mediaCount[msgID] = idx + 1
+		partID := msgID
+		if idx == 0 {
+			setAttachLabel(msgID, label)
+		} else {
+			partID = fmt.Sprintf("%s#%d", msgID, idx)
+		}
+		thID := emitThreadID(threadKey)
+		if kind != "" && url != "" {
+			emit(map[string]any{"type": "media", "id": partID, "thread": thID, "kind": kind, "url": url})
+			if idx > 0 {
+				if meta, ok := getMsgMeta(msgID); ok {
+					emit(map[string]any{
+						"type":   "message",
+						"id":     partID,
+						"thread": emitThreadID(meta.thread),
+						"sender": fmtID(meta.sender),
+						"text":   label,
+						"ts":     float64(meta.ts) + float64(idx)*0.001,
+						"live":   false,
+						"system": false,
+					})
+				}
 			}
 		}
 	}
-	// Pictures/stickers in regular chats render inline straight from their CDN URL.
-	for _, a := range tbl.LSInsertAttachment {
-		if a.MessageId == "" {
-			continue
+
+	for _, a := range tbl.LSInsertBlobAttachment {
+		preview := a.PreviewUrlLarge
+		if preview == "" {
+			preview = a.PreviewUrl
 		}
+		kind, url := blobMedia(a.AttachmentType, a.AttachmentMimeType, a.PlayableUrl, preview)
+		label := blobLabel(a.AttachmentType, a.AttachmentMimeType)
+		if a.Filename != "" && kind == "file" {
+			label = "📎 " + a.Filename
+		}
+		emitAttachmentPart(a.MessageId, a.AttachmentFbid, a.ThreadKey, kind, url, label)
+	}
+	for _, a := range tbl.LSInsertAttachment {
 		url := a.PreviewUrl
 		if url == "" {
 			url = a.PlayableUrl
@@ -643,22 +1164,20 @@ func processTable(tbl *table.LSTable, live bool) {
 		case table.AttachmentTypeFile:
 			kind, url = "file", a.PlayableUrl
 		}
-		if kind != "" && url != "" {
-			emit(map[string]any{"type": "media", "id": a.MessageId, "thread": emitThreadID(a.ThreadKey), "kind": kind, "url": url})
+		label := attachTypeLabel(a.AttachmentType)
+		if a.Filename != "" && kind == "file" {
+			label = "📎 " + a.Filename
 		}
+		emitAttachmentPart(a.MessageId, a.AttachmentFbid, a.ThreadKey, kind, url, label)
 	}
-	for _, a := range tbl.LSInsertBlobAttachment {
-		if a.MessageId == "" {
-			continue
-		}
-		kind, url := blobMedia(a.AttachmentType, a.AttachmentMimeType, a.PlayableUrl, a.PreviewUrl)
-		if kind != "" && url != "" {
-			emit(map[string]any{"type": "media", "id": a.MessageId, "thread": emitThreadID(a.ThreadKey), "kind": kind, "url": url})
-		}
-	}
+
 	// A link card's URL lives in its CTA ("open" button) row, often wrapped in facebook's l.php redirect.
 	for _, cta := range tbl.LSInsertAttachmentCta {
-		u := unwrapLPHP(cta.ActionUrl)
+		raw := cta.ActionUrl
+		if raw == "" {
+			raw = cta.NativeUrl
+		}
+		u := unwrapLPHP(raw)
 		if u == "" || cta.MessageId == "" {
 			continue
 		}
@@ -666,7 +1185,6 @@ func processTable(tbl *table.LSTable, live bool) {
 		emit(map[string]any{"type": "linkurl", "id": cta.MessageId, "thread": emitThreadID(cta.ThreadKey), "url": u})
 	}
 	for _, a := range tbl.LSInsertXmaAttachment {
-		// shared items (links, reels, posts) are link cards, NOT pictures the user sent
 		if a.MessageId == "" {
 			continue
 		}
@@ -677,6 +1195,9 @@ func processTable(tbl *table.LSTable, live bool) {
 			}
 		}
 		img := a.ImageUrl
+		if img == "" {
+			img = a.PreviewUrlLarge
+		}
 		if img == "" {
 			img = a.PreviewUrl
 		}
@@ -702,21 +1223,37 @@ func processTable(tbl *table.LSTable, live bool) {
 			emit(map[string]any{"type": "media", "id": a.MessageId, "thread": emitThreadID(a.ThreadKey), "kind": "sticker", "url": url})
 		}
 	}
-	emitMsg := func(id string, thread, sender, ts int64, text string, system bool, replyID, replyText string, replyTo int64) {
+
+	emitMsg := func(id string, thread, sender, ts, stickerID int64, text string, system bool, replyID, replyText, replySnippet string, replyTo int64) {
+		if id == "" {
+			return
+		}
 		if text == "" {
-			text = attachLabel[id] // attachment-only message → typed placeholder
+			text = getAttachLabel(id)
+		}
+		if text == "" && stickerID != 0 {
+			text = "💟 Sticker"
+		}
+		if text == "" && !system {
+			text = "📎 Attachment"
 		}
 		if text == "" {
 			return
 		}
+		thID := emitThreadID(thread)
+		noteThreadWatermark(thID, 0, ts)
 		ev := map[string]any{
-			"type": "message", "id": id, "thread": emitThreadID(thread), "sender": fmtID(sender),
+			"type": "message", "id": id, "thread": thID, "sender": fmtID(sender),
 			"text": text, "ts": ts, "live": live, "system": system,
 		}
-		if replyID != "" { // this message is a reply — carry the quoted source
+		if replyID != "" {
 			ev["replyToId"] = replyID
-			if replyText != "" {
-				ev["replyToText"] = replyText
+			quoted := replyText
+			if quoted == "" {
+				quoted = replySnippet
+			}
+			if quoted != "" {
+				ev["replyToText"] = quoted
 			}
 			if replyTo != 0 {
 				ev["replyToSender"] = fmtID(replyTo)
@@ -724,10 +1261,10 @@ func processTable(tbl *table.LSTable, live bool) {
 		}
 		emit(ev)
 	}
-	// An unsent message arrives as an insert/upsert/delete-then-insert row with IsUnsent set:
-	// drop it from the UI instead of showing it.
 	emitUnsent := func(id string, thread int64) {
-		emit(map[string]any{"type": "delete", "thread": emitThreadID(thread), "id": id})
+		if id != "" {
+			emit(map[string]any{"type": "delete", "thread": emitThreadID(thread), "id": id})
+		}
 	}
 	for _, m := range tbl.LSInsertMessage {
 		if m.IsUnsent {
@@ -735,8 +1272,8 @@ func processTable(tbl *table.LSTable, live bool) {
 			continue
 		}
 		noteSticker(m.MessageId, m.StickerId, "", true)
-		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, likeText(m.StickerId, m.Text), m.IsAdminMessage,
-			m.ReplySourceId, m.ReplyMessageText, m.ReplyToUserId)
+		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
+			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId)
 	}
 	for _, m := range tbl.LSUpsertMessage {
 		if m.IsUnsent {
@@ -744,8 +1281,8 @@ func processTable(tbl *table.LSTable, live bool) {
 			continue
 		}
 		noteSticker(m.MessageId, m.StickerId, "", true)
-		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, likeText(m.StickerId, m.Text), m.IsAdminMessage,
-			m.ReplySourceId, m.ReplyMessageText, m.ReplyToUserId)
+		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
+			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId)
 	}
 	for _, m := range tbl.LSDeleteThenInsertMessage {
 		if m.IsUnsent {
@@ -753,13 +1290,12 @@ func processTable(tbl *table.LSTable, live bool) {
 			continue
 		}
 		noteSticker(m.MessageId, m.StickerId, "", true)
-		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, likeText(m.StickerId, m.Text), m.IsAdminMessage,
-			m.ReplySourceId, m.ReplyMessageText, m.ReplyToUserId)
+		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
+			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId)
 	}
 }
 
-// sendMediaMessage reads a picked file and sends it as a picture. Encrypted threads
-// go through the WhatsApp-protocol upload+send; regular threads aren't wired yet.
+// sendMediaMessage reads a picked file and sends it as media.
 func sendMediaMessage(threadStr, path, caption string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -796,9 +1332,6 @@ func sendMediaMessage(threadStr, path, caption string) {
 	}
 }
 
-// sendMediaRegular sends a photo/video/file to a regular (non-encrypted) thread: upload the
-// bytes via the Mercury endpoint (same path as group photos) to get a media fbid, then send a
-// SendMessageTask that references it. The sent message echoes back through the normal sync.
 func sendMediaRegular(threadStr string, data []byte, mime, caption, fileName string) error {
 	tid, err := strconv.ParseInt(threadStr, 10, 64)
 	if err != nil {
@@ -828,16 +1361,14 @@ func sendMediaRegular(threadStr string, data []byte, mime, caption, fileName str
 		Source:           table.MESSENGER_INBOX_IN_THREAD,
 		InitiatingSource: table.FACEBOOK_INBOX,
 		SendType:         table.MEDIA,
-		SyncGroup:        1,
+		SyncGroup:        syncGroupFor(tid),
 		AttachmentFBIds:  []int64{fbid},
 		Text:             caption,
 	}
-	_, err = client.ExecuteTasks(context.Background(), task)
+	_, err = runTasks(context.Background(), task)
 	return err
 }
 
-// sendGif sends a GIF to a regular (non-encrypted) thread as an external-media link.
-// (Encrypted threads download + upload the GIF as media on the app side instead.)
 func sendGif(threadStr, gifURL string) {
 	tid, err := strconv.ParseInt(threadStr, 10, 64)
 	if err != nil || client == nil {
@@ -849,15 +1380,14 @@ func sendGif(threadStr, gifURL string) {
 		Source:           table.MESSENGER_INBOX_IN_THREAD,
 		InitiatingSource: table.FACEBOOK_INBOX,
 		SendType:         table.EXTERNAL_MEDIA,
-		SyncGroup:        1,
+		SyncGroup:        syncGroupFor(tid),
 		Url:              gifURL,
 	}
-	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
+	if _, err := runTasks(context.Background(), task); err != nil {
 		emit(map[string]any{"type": "error", "msg": "gif: " + err.Error()})
 	}
 }
 
-// unsendMessage deletes one of our messages for everyone.
 func unsendMessage(threadStr, msgID string) {
 	if msgID == "" {
 		return
@@ -868,15 +1398,11 @@ func unsendMessage(threadStr, msgID string) {
 		}
 		return
 	}
-	if client == nil {
-		return
-	}
-	if _, err := client.ExecuteTasks(context.Background(), &socket.DeleteMessageTask{MessageId: msgID}); err != nil {
+	if _, err := runTasks(context.Background(), &socket.DeleteMessageTask{MessageId: msgID}); err != nil {
 		emit(map[string]any{"type": "error", "msg": "unsend: " + err.Error()})
 	}
 }
 
-// editMessage changes the text of one of our already-sent messages.
 func editMessage(threadStr, msgID, text string) {
 	if msgID == "" {
 		return
@@ -887,15 +1413,11 @@ func editMessage(threadStr, msgID, text string) {
 		}
 		return
 	}
-	if client == nil {
-		return
-	}
-	if _, err := client.ExecuteTasks(context.Background(), &socket.EditMessageTask{MessageID: msgID, Text: text}); err != nil {
+	if _, err := runTasks(context.Background(), &socket.EditMessageTask{MessageID: msgID, Text: text}); err != nil {
 		emit(map[string]any{"type": "error", "msg": "edit: " + err.Error()})
 	}
 }
 
-// sendReaction adds/removes a reaction (emoji "" = remove) on a message.
 func sendReaction(threadStr, msgID, emoji string, fromMe bool) {
 	if strings.HasPrefix(threadStr, "e:") {
 		if err := sendE2EEReaction(strings.TrimPrefix(threadStr, "e:"), msgID, emoji, fromMe); err != nil {
@@ -912,16 +1434,15 @@ func sendReaction(threadStr, msgID, emoji string, fromMe bool) {
 		MessageID:       msgID,
 		ActorID:         toInt64(selfFBID),
 		Reaction:        emoji,
-		SyncGroup:       1,
+		SyncGroup:       int(syncGroupFor(tid)),
 		SendAttribution: table.MESSENGER_INBOX_IN_THREAD,
 	}
-	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
+	if _, err := runTasks(context.Background(), task); err != nil {
 		emit(map[string]any{"type": "error", "msg": "react: " + err.Error()})
 	}
 }
 
-// setMute mutes (forever) or unmutes a conversation. Works for encrypted 1:1
-// threads too — their fbid doubles as the Lightspeed thread key.
+// setMute mutes (forever) or unmutes a conversation.
 func setMute(threadStr string, muted bool) {
 	tid := toInt64(strings.TrimPrefix(threadStr, "e:"))
 	if tid == 0 || client == nil {
@@ -931,8 +1452,16 @@ func setMute(threadStr string, muted bool) {
 	if muted {
 		expire = 9223372036854775807 // max int64 → mute forever
 	}
-	task := &socket.MuteThreadTask{ThreadKey: tid, MailboxType: 0, MuteExpireTimeMS: expire, SyncGroup: 1}
-	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
+	target := tid
+	sg := syncGroupFor(tid)
+	if strings.HasPrefix(threadStr, "e:") {
+		if fbKey := getHybridFBKey(tid); fbKey != 0 {
+			target = fbKey
+			sg = 95
+		}
+	}
+	task := &socket.MuteThreadTask{ThreadKey: target, MailboxType: 0, MuteExpireTimeMS: expire, SyncGroup: sg}
+	if _, err := runTasks(context.Background(), task); err != nil {
 		log.Warn().Err(err).Msg("mute failed")
 		emit(map[string]any{"type": "error", "msg": "mute: " + err.Error()})
 	}
@@ -944,21 +1473,25 @@ func deleteThread(threadStr string) {
 	if tid == 0 || client == nil {
 		return
 	}
-	task := &socket.DeleteThreadTask{ThreadKey: tid, RemoveType: 0, SyncGroup: 1}
-	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
+	target := tid
+	sg := syncGroupFor(tid)
+	if strings.HasPrefix(threadStr, "e:") {
+		if fbKey := getHybridFBKey(tid); fbKey != 0 {
+			target = fbKey
+			sg = 95
+		}
+	}
+	task := &socket.DeleteThreadTask{ThreadKey: target, RemoveType: 0, SyncGroup: sg}
+	if _, err := runTasks(context.Background(), task); err != nil {
 		log.Warn().Err(err).Msg("delete thread failed")
 		emit(map[string]any{"type": "error", "msg": "delete: " + err.Error()})
 	}
 }
 
-// groupKey is the Lightspeed thread key for a group (strip the "e:" UI namespace).
 func groupKey(threadStr string) int64 { return toInt64(strings.TrimPrefix(threadStr, "e:")) }
 
 func runTask(label string, task socket.Task) {
-	if client == nil {
-		return
-	}
-	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
+	if _, err := runTasks(context.Background(), task); err != nil {
 		log.Warn().Err(err).Str("task", label).Msg("group task failed")
 		emit(map[string]any{"type": "error", "msg": label + ": " + err.Error()})
 	}
@@ -966,7 +1499,7 @@ func runTask(label string, task socket.Task) {
 
 func renameThread(threadStr, name string) {
 	if tid := groupKey(threadStr); tid != 0 {
-		runTask("rename", &socket.RenameThreadTask{ThreadKey: tid, ThreadName: name, SyncGroup: 1})
+		runTask("rename", &socket.RenameThreadTask{ThreadKey: tid, ThreadName: name, SyncGroup: syncGroupFor(tid)})
 	}
 }
 
@@ -984,7 +1517,7 @@ func addMembers(threadStr string, idsAny any) {
 		}
 	}
 	if len(ids) > 0 {
-		runTask("addMembers", &socket.AddParticipantsTask{ThreadKey: tid, ContactIDs: ids, SyncGroup: 1})
+		runTask("addMembers", &socket.AddParticipantsTask{ThreadKey: tid, ContactIDs: ids, SyncGroup: syncGroupFor(tid)})
 	}
 }
 
@@ -1007,7 +1540,6 @@ func setThreadAdmin(threadStr, idStr string, admin bool) {
 	runTask("setAdmin", &socket.UpdateAdminTask{ThreadKey: tid, ContactID: cid, IsAdmin: isAdmin})
 }
 
-// leaveThread removes ourselves from the group.
 func leaveThread(threadStr string) {
 	tid, cid := groupKey(threadStr), toInt64(selfFBID)
 	if tid != 0 && cid != 0 {
@@ -1015,8 +1547,6 @@ func leaveThread(threadStr string) {
 	}
 }
 
-// setGroupPhoto uploads an image (Mercury) to get an image id, then sets it as the
-// group's photo.
 func setGroupPhoto(threadStr, path string) {
 	tid := groupKey(threadStr)
 	if tid == 0 || client == nil {
@@ -1041,10 +1571,9 @@ func setGroupPhoto(threadStr, path string) {
 		emit(map[string]any{"type": "error", "msg": "photo: no image id from upload"})
 		return
 	}
-	runTask("setPhoto", &socket.SetThreadImageTask{ThreadKey: tid, ImageID: imageID, SyncGroup: 1})
+	runTask("setPhoto", &socket.SetThreadImageTask{ThreadKey: tid, ImageID: imageID, SyncGroup: syncGroupFor(tid)})
 }
 
-// createGroup starts a new group conversation with the given participant ids.
 func createGroup(name string, idsAny any) {
 	if client == nil {
 		return
@@ -1067,17 +1596,18 @@ func createGroup(name string, idsAny any) {
 			ThreadID: 0, OTID: strconv.FormatInt(otid, 10), Source: 0, SendType: 8,
 		},
 	}
-	tbl, err := client.ExecuteTasks(context.Background(), task)
+	tbl, err := runTasks(context.Background(), task)
 	if err != nil {
 		emit(map[string]any{"type": "error", "msg": "create group: " + err.Error()})
 		return
 	}
-	if tbl != nil {
-		processTable(tbl, false)
-	}
-	// Name it once it exists (the new thread arrives on the publish stream).
 	if name = strings.TrimSpace(name); name != "" && tbl != nil {
 		for _, th := range tbl.LSDeleteThenInsertThread {
+			if th.ThreadKey != 0 {
+				go renameThread(fmtID(th.ThreadKey), name)
+			}
+		}
+		for _, th := range tbl.LSUpdateOrInsertThread {
 			if th.ThreadKey != 0 {
 				go renameThread(fmtID(th.ThreadKey), name)
 			}
@@ -1085,28 +1615,98 @@ func createGroup(name string, idsAny any) {
 	}
 }
 
-// markReadServer sends a read receipt so the other side sees "Seen".
-func markReadServer(threadStr, msgID, sender string, tsMs int64) {
-	if strings.HasPrefix(threadStr, "e:") {
-		markE2EERead(strings.TrimPrefix(threadStr, "e:"), msgID, sender, tsMs)
-		return
+// markReadServer synchronizes the read state with Meta's servers on BOTH WhatsApp E2EE
+// (for "Seen" receipts on companion devices) and Lightspeed (SyncGroup 95 / 1 / 104,
+// which drives LastReadWatermarkTimestampMs when the app restarts).
+func markReadServer(threadStr, msgID string, msgIDs []string, sender string, tsMs int64) {
+	wm := getThreadWatermark(threadStr)
+	if wm.lastActivity > tsMs {
+		tsMs = wm.lastActivity
 	}
-	tid, err := strconv.ParseInt(threadStr, 10, 64)
-	if err != nil {
-		return
-	}
-	if tsMs == 0 {
+	if tsMs <= 0 {
 		tsMs = time.Now().UnixMilli()
 	}
-	task := &socket.ThreadMarkReadTask{ThreadId: tid, LastReadWatermarkTs: tsMs, SyncGroup: 1}
-	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
-		log.Debug().Err(err).Msg("mark read failed")
+	// WhatsApp message timestamps have 1-second resolution (000ms), whereas Lightspeed's
+	// LastActivityTimestampMs has millisecond precision; add 999ms so the watermark is >= activity.
+	if tsMs%1000 == 0 {
+		tsMs += 999
+	}
+	noteThreadWatermark(threadStr, tsMs, 0)
+
+	if strings.HasPrefix(threadStr, "e:") {
+		raw := strings.TrimPrefix(threadStr, "e:")
+		allIDs := make([]string, 0, len(msgIDs)+1)
+		seen := map[string]bool{}
+		for _, id := range msgIDs {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				allIDs = append(allIDs, id)
+			}
+		}
+		if msgID != "" && !seen[msgID] {
+			allIDs = append(allIDs, msgID)
+		}
+		if len(allIDs) > 0 {
+			markE2EERead(raw, allIDs, sender, tsMs)
+		}
+
+		// Also update Lightspeed's thread read watermark (SyncGroup 95 hybrid row, JID row,
+		// and any linked pre-cutover open thread in SyncGroup 1) so restarting the app
+		// won't reload an old LastReadWatermarkTimestampMs < LastActivityTimestampMs!
+		jid := toInt64(raw)
+		if jid != 0 && client != nil {
+			var tasks []socket.Task
+			added := map[[2]int64]bool{}
+			addMark := func(tk, sg int64) {
+				if tk == 0 || sg == 0 {
+					return
+				}
+				k := [2]int64{tk, sg}
+				if !added[k] {
+					added[k] = true
+					tasks = append(tasks, &socket.ThreadMarkReadTask{
+						ThreadId:            tk,
+						LastReadWatermarkTs: tsMs,
+						SyncGroup:           sg,
+					})
+				}
+			}
+			if fbKey := getHybridFBKey(jid); fbKey != 0 {
+				addMark(fbKey, 95)
+			}
+			sg := syncGroupFor(jid)
+			addMark(jid, sg)
+			if sg != 95 {
+				addMark(jid, 95)
+			}
+			if openID := getOpenThreadForE2EE(jid); openID != 0 {
+				addMark(openID, 1)
+			}
+			if len(tasks) > 0 {
+				if _, err := runTasks(context.Background(), tasks...); err != nil {
+					log.Debug().Err(err).Str("thread", threadStr).Msg("E2EE LS mark read failed")
+				}
+			}
+		}
+		return
+	}
+
+	tid, err := strconv.ParseInt(threadStr, 10, 64)
+	if err != nil || tid == 0 {
+		return
+	}
+	sg := syncGroupFor(tid)
+	task := &socket.ThreadMarkReadTask{
+		ThreadId:            tid,
+		LastReadWatermarkTs: tsMs,
+		SyncGroup:           sg,
+	}
+	if _, err := runTasks(context.Background(), task); err != nil {
+		log.Debug().Err(err).Str("thread", threadStr).Msg("mark read failed")
 	}
 }
 
 func sendMessage(threadStr, text, replyID, replySender, clientTag string) {
-	// Encrypted threads (namespaced "e:<fbid>") go through the WhatsApp-protocol
-	// E2EE client; everything else through the regular Lightspeed task.
 	if strings.HasPrefix(threadStr, "e:") {
 		sendE2EE(strings.TrimPrefix(threadStr, "e:"), text, replyID, replySender, clientTag)
 		return
@@ -1115,21 +1715,47 @@ func sendMessage(threadStr, text, replyID, replySender, clientTag string) {
 	if err != nil {
 		return
 	}
+	otid := methods.GenerateEpochID()
+	otidStr := strconv.FormatInt(otid, 10)
 	task := &socket.SendMessageTask{
 		ThreadId:         tid,
-		Otid:             methods.GenerateEpochID(),
+		Otid:             otid,
 		Source:           table.MESSENGER_INBOX_IN_THREAD,
 		InitiatingSource: table.FACEBOOK_INBOX,
 		SendType:         table.TEXT,
-		SyncGroup:        1,
+		SyncGroup:        syncGroupFor(tid),
 		Text:             text,
 	}
 	if replyID != "" {
 		task.ReplyMetaData = &socket.ReplyMetaData{ReplyMessageId: replyID, ReplySourceType: 1, ReplyType: 0}
 	}
-	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
+	tbl, err := runTasks(context.Background(), task)
+	if err != nil {
 		log.Warn().Err(err).Msg("send failed")
 		emit(map[string]any{"type": "sendFailed", "thread": threadStr, "clientTag": clientTag, "msg": "send failed: " + err.Error()})
+		return
+	}
+	if tbl != nil {
+		for _, f := range tbl.LSMarkOptimisticMessageFailed {
+			if f.OTID == "" || f.OTID == otidStr {
+				msg := f.Message
+				if msg == "" {
+					msg = "server rejected message"
+				}
+				emit(map[string]any{"type": "sendFailed", "thread": threadStr, "clientTag": clientTag, "msg": msg})
+				return
+			}
+		}
+		for _, f := range tbl.LSHandleFailedTask {
+			if f.OTID == otidStr {
+				msg := f.Message
+				if msg == "" {
+					msg = "task failed on server"
+				}
+				emit(map[string]any{"type": "sendFailed", "thread": threadStr, "clientTag": clientTag, "msg": msg})
+				return
+			}
+		}
 	}
 }
 
@@ -1138,11 +1764,6 @@ var (
 	requestedContactsMu sync.Mutex
 )
 
-// fetchContact pulls a person's full profile (name + avatar) by FBID. This is how
-// we resolve people we only know through encrypted threads — their contact row is
-// never part of the normal message sync, so without this their chat shows up as
-// "Conversation" with no picture. The result comes back as a contact row (handled
-// in processTable) both synchronously here and via the live publish stream.
 func fetchContact(id int64) {
 	if id == 0 || client == nil {
 		return
@@ -1154,15 +1775,10 @@ func fetchContact(id int64) {
 	if already {
 		return
 	}
-	// The socket may not be connected the instant we're asked (the app can trigger
-	// this right as we come up), so retry a few times before giving up.
 	var lastErr error
 	for attempt := 0; attempt < 6; attempt++ {
-		tbl, err := client.ExecuteTasks(context.Background(), &socket.GetContactsFullTask{ContactID: id})
+		_, err := runTasks(context.Background(), &socket.GetContactsFullTask{ContactID: id})
 		if err == nil {
-			if tbl != nil {
-				processTable(tbl, false)
-			}
 			return
 		}
 		lastErr = err
@@ -1170,69 +1786,146 @@ func fetchContact(id int64) {
 	}
 	log.Warn().Err(lastErr).Int64("id", id).Msg("fetchContact gave up")
 	requestedContactsMu.Lock()
-	delete(requestedContacts, id) // allow a later attempt
+	delete(requestedContacts, id)
 	requestedContactsMu.Unlock()
 }
 
-// refreshThread pulls the most recent messages for a thread from the server (anchored
-// just ahead of "now") and merges them — so opening a chat catches anything sent while
-// the app was closed. Works for regular threads; encrypted-chat messages don't live in
-// Lightspeed, so this is a no-op for them (they sync over the encrypted channel instead).
-func refreshThread(threadStr string) {
+var refreshLocks sync.Map // string -> *sync.Mutex
+
+func threadRefreshLock(threadStr string) *sync.Mutex {
+	v, _ := refreshLocks.LoadOrStore(threadStr, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// refreshThread pulls the newest messages for a thread and, when `sinceTs > 0`,
+// paginates backwards up to `sinceTs` so messages missed while the app was closed
+// never leave an unfillable hole in the middle of local history.
+func refreshThread(threadStr string, sinceTs int64) {
+	tid := toInt64(strings.TrimPrefix(threadStr, "e:"))
+	if tid == 0 || client == nil {
+		return
+	}
+	mu := threadRefreshLock(threadStr)
+	if sinceTs <= 0 {
+		if !mu.TryLock() {
+			return
+		}
+	} else {
+		mu.Lock()
+	}
+	defer mu.Unlock()
+
+	if strings.HasPrefix(threadStr, "e:") {
+		markE2EEKey(tid)
+		if hasHistoryDevice() {
+			refreshEncryptedHistory(threadStr, sinceTs)
+		}
+		// If this chat was upgraded from a non-E2EE chat and we have no messages yet,
+		// also pull its pre-cutover Lightspeed messages so the chat isn't blank.
+		if openID := getOpenThreadForE2EE(tid); openID != 0 && sinceTs <= 0 {
+			_, _ = runTasks(context.Background(),
+				&socket.CreateThreadTask{ThreadFBID: openID, SyncGroup: 1},
+				&socket.FetchMessagesTask{
+					ThreadKey:            openID,
+					Direction:            0,
+					ReferenceTimestampMs: time.Now().UnixMilli() + 60_000,
+					ReferenceMessageId:   "",
+					SyncGroup:            1,
+					Cursor:               client.GetCursor(1),
+				},
+			)
+		}
+		return
+	}
+
+	sg := syncGroupFor(tid)
+	cursorDB := cursorDBFor(sg)
+	_, gen0 := getLastRange(tid)
+	tasks := []socket.Task{
+		&socket.CreateThreadTask{
+			ThreadFBID: tid,
+			SyncGroup:  int(sg),
+		},
+		&socket.FetchMessagesTask{
+			ThreadKey:            tid,
+			Direction:            0,
+			ReferenceTimestampMs: time.Now().UnixMilli() + 60_000,
+			ReferenceMessageId:   "",
+			SyncGroup:            sg,
+			Cursor:               client.GetCursor(cursorDB),
+		},
+	}
+	if _, err := runTasks(context.Background(), tasks...); err != nil {
+		log.Warn().Err(err).Int64("thread", tid).Msg("refreshThread failed")
+		return
+	}
+
+	// Forward gap-fill: if the local DB had messages up to `sinceTs`, keep walking
+	// backwards (bounded to 5 pages) until the fetched range reaches `sinceTs`.
+	if sinceTs > 0 {
+		for page := 0; page < 5; page++ {
+			waitForRangeUpdate(tid, gen0, 2500*time.Millisecond)
+			rng, gen1 := getLastRange(tid)
+			if rng == nil || gen1 == gen0 {
+				break
+			}
+			gen0 = gen1
+			if !rng.HasMoreBefore || rng.MinMessageId == "" || rng.MinTimestampMs <= sinceTs {
+				break
+			}
+			nextTask := &socket.FetchMessagesTask{
+				ThreadKey:            tid,
+				Direction:            0,
+				ReferenceTimestampMs: rng.MinTimestampMs,
+				ReferenceMessageId:   rng.MinMessageId,
+				SyncGroup:            sg,
+				Cursor:               client.GetCursor(cursorDB),
+			}
+			if _, err := runTasks(context.Background(), nextTask); err != nil {
+				break
+			}
+		}
+	}
+}
+
+// loadEarlier backfills older messages before the oldest one the app currently has.
+func loadEarlier(threadStr, oldestID string, oldestTs int64, fromMe bool) {
+	_ = fromMe
 	tid := toInt64(strings.TrimPrefix(threadStr, "e:"))
 	if tid == 0 || client == nil {
 		return
 	}
 	if strings.HasPrefix(threadStr, "e:") {
 		markE2EEKey(tid)
+		if openID := getOpenThreadForE2EE(tid); openID != 0 {
+			tid = openID
+		}
 	}
-	task := &socket.FetchMessagesTask{
+	sg := syncGroupFor(tid)
+	cursorDB := cursorDBFor(sg)
+	refTs := oldestTs
+	if refTs <= 0 {
+		refTs = time.Now().UnixMilli() + 60_000
+	}
+	var tasks []socket.Task
+	if oldestID == "" {
+		tasks = append(tasks, &socket.CreateThreadTask{
+			ThreadFBID: tid,
+			SyncGroup:  int(sg),
+		})
+	}
+	tasks = append(tasks, &socket.FetchMessagesTask{
 		ThreadKey:            tid,
 		Direction:            0,
-		ReferenceTimestampMs: time.Now().UnixMilli() + 60_000, // just ahead of now → newest messages
-		ReferenceMessageId:   "",
-		SyncGroup:            1,
-		Cursor:               client.GetCursor(1),
-	}
-	if tbl, err := client.ExecuteTasks(context.Background(), task); err != nil {
-		log.Warn().Err(err).Int64("thread", tid).Msg("refreshThread failed")
-	} else if tbl != nil {
-		processTable(tbl, false)
-	}
-}
-
-// loadEarlier backfills older messages before the oldest one the app currently has.
-// Encrypted threads request on-demand history from the phone; regular threads use
-// the Lightspeed FetchMessages task.
-func loadEarlier(threadStr, oldestID string, oldestTs int64, fromMe bool) {
-	// Both regular AND encrypted 1:1 threads backfill through the same Lightspeed
-	// fetch — Meta serves history for E2EE-over-WA one-to-one chats the same way
-	// (only E2EE *groups* are excluded). The E2EE thread id is "e:<fbid>" where the
-	// fbid doubles as the Lightspeed thread key. The Cursor is required or the server
-	// ignores the request. Results arrive asynchronously via the publish stream.
-	tid := toInt64(strings.TrimPrefix(threadStr, "e:"))
-	if tid == 0 || client == nil {
-		return
-	}
-	if strings.HasPrefix(threadStr, "e:") {
-		markE2EEKey(tid) // so the backfilled messages merge into the encrypted thread
-	}
-	task := &socket.FetchMessagesTask{
-		ThreadKey:            tid,
-		Direction:            0,
-		ReferenceTimestampMs: oldestTs,
+		ReferenceTimestampMs: refTs,
 		ReferenceMessageId:   oldestID,
-		SyncGroup:            1,
-		Cursor:               client.GetCursor(1),
-	}
-	tbl, err := client.ExecuteTasks(context.Background(), task)
-	if err != nil {
+		SyncGroup:            sg,
+		Cursor:               client.GetCursor(cursorDB),
+	})
+	if _, err := runTasks(context.Background(), tasks...); err != nil {
 		log.Warn().Err(err).Int64("thread", tid).Msg("fetch messages failed")
 		emit(map[string]any{"type": "error", "msg": "history: " + err.Error()})
 		return
-	}
-	if tbl != nil {
-		processTable(tbl, false)
 	}
 	log.Info().Int64("thread", tid).Str("before", oldestID).Msg("requested earlier history")
 }
@@ -1263,8 +1956,6 @@ func likeText(stickerID int64, text string) string {
 	return text
 }
 
-// Stickers seen in chats (their id comes with the message row, their picture with the attachment
-// row). Once both are known the app is told, so it can offer them again as "recent stickers".
 var (
 	stickerMu   sync.Mutex
 	stickerIDs  = map[string]int64{}
@@ -1272,14 +1963,12 @@ var (
 	stickerDone = map[string]bool{}
 )
 
-// noteSticker records half of a sticker's story: its id (from the message row, authoritative, or
-// from the sticker row's target id as a fallback) and/or its picture address.
 func noteSticker(msgID string, id int64, url string, fromMessage bool) {
 	if msgID == "" {
 		return
 	}
 	switch id {
-	case 369239263222822, 369239343222814, 369239383222810: // the Like button, not a real sticker
+	case 369239263222822, 369239343222814, 369239383222810:
 		id = 0
 	}
 	stickerMu.Lock()
@@ -1296,7 +1985,7 @@ func noteSticker(msgID string, id int64, url string, fromMessage bool) {
 		return
 	}
 	stickerDone[msgID] = true
-	if len(stickerDone) > 5000 { // keep memory small; a repeat only re-announces a sticker
+	if len(stickerDone) > 5000 {
 		stickerDone = map[string]bool{}
 		stickerIDs = map[string]int64{}
 		stickerURLs = map[string]string{}
@@ -1304,7 +1993,6 @@ func noteSticker(msgID string, id int64, url string, fromMessage bool) {
 	emit(map[string]any{"type": "stickerSeen", "stickerId": fmt.Sprint(stickerIDs[msgID]), "url": stickerURLs[msgID]})
 }
 
-// sendSticker sends one of the stickers seen before into a regular chat.
 func sendSticker(threadStr string, stickerID int64) {
 	tid, err := strconv.ParseInt(threadStr, 10, 64)
 	if err != nil || client == nil {
@@ -1317,10 +2005,10 @@ func sendSticker(threadStr string, stickerID int64) {
 		Source:           table.MESSENGER_INBOX_IN_THREAD,
 		InitiatingSource: table.FACEBOOK_INBOX,
 		SendType:         table.STICKER,
-		SyncGroup:        1,
+		SyncGroup:        syncGroupFor(tid),
 		StickerId:        stickerID,
 	}
-	if _, err := client.ExecuteTasks(context.Background(), task); err != nil {
+	if _, err := runTasks(context.Background(), task); err != nil {
 		log.Error().Err(err).Msg("send sticker failed")
 		emit(map[string]any{"type": "error", "msg": "sticker: " + err.Error()})
 	}
@@ -1329,11 +2017,10 @@ func sendSticker(threadStr string, stickerID int64) {
 var (
 	threadsMu sync.Mutex
 	oldestMu  sync.Mutex
-	oldestKey int64 // the oldest regular chat seen so far: where the next older page starts
+	oldestKey int64
 	oldestTs  int64
 )
 
-// noteOldestThread remembers the oldest regular inbox chat that has been received.
 func noteOldestThread(key, ts, parent int64, folder string) {
 	if key == 0 || ts <= 0 || folder != "inbox" || parent > 0 {
 		return
@@ -1345,14 +2032,9 @@ func noteOldestThread(key, ts, parent int64, folder string) {
 	}
 }
 
-// threadBackfill is true while older chat pages are being fetched: whatever arrives then is
-// history, not new activity (no unread badges, no notifications).
 var threadBackfill atomic.Bool
 var threadRowsSeen atomic.Int64
 
-// loadMoreThreads pulls older pages of the chat list (the first sync only has the newest chats).
-// Each page is requested after the oldest regular chat received so far (parent key 0 is the
-// main inbox, -1 holds message requests); the chats arrive over the socket, so wait until they have settled.
 func loadMoreThreads(maxPages int) {
 	if client == nil || !threadsMu.TryLock() {
 		return
@@ -1360,7 +2042,7 @@ func loadMoreThreads(maxPages int) {
 	defer threadsMu.Unlock()
 	threadBackfill.Store(true)
 	defer func() {
-		time.Sleep(3 * time.Second) // late socket tables of the last page still count as history
+		time.Sleep(3 * time.Second)
 		threadBackfill.Store(false)
 	}()
 	for i := 0; i < maxPages; i++ {
@@ -1382,7 +2064,7 @@ func loadMoreThreads(maxPages int) {
 		before := threadRowsSeen.Load()
 		tbl, err := client.ExecuteTasks(context.Background(), task)
 		for wait := 0; err != nil && strings.Contains(err.Error(), "not open") && wait < 10; wait++ {
-			time.Sleep(3 * time.Second) // the socket is still connecting
+			time.Sleep(3 * time.Second)
 			tbl, err = client.ExecuteTasks(context.Background(), task)
 		}
 		if err != nil {
@@ -1391,8 +2073,8 @@ func loadMoreThreads(maxPages int) {
 		}
 		if tbl != nil {
 			processTable(tbl, false)
+			client.PostHandlePublishResponse(tbl)
 		}
-		// wait for the chats to arrive and for the flow to settle
 		last, quietSince := before, time.Now()
 		for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
 			time.Sleep(400 * time.Millisecond)
@@ -1405,7 +2087,7 @@ func loadMoreThreads(maxPages int) {
 		oldestMu.Lock()
 		moved := oldestTs != refTs
 		oldestMu.Unlock()
-		if !moved { // nothing older arrived: the list is complete
+		if !moved {
 			emit(map[string]any{"type": "threadsDone"})
 			return
 		}

@@ -18,6 +18,10 @@ pub struct Thread {
     pub parent: String,
     /// "inbox" | "requests" | "archived" | "spam" | "hidden" ("" = unknown, treated as inbox)
     pub folder: String,
+    /// Local watermark (ms) up to which the user has read this conversation.
+    pub read_up_to: f64,
+    /// Watermark (ms) already sent to / confirmed by the server.
+    pub synced_read_up_to: f64,
 }
 
 #[derive(Default, Clone)]
@@ -114,6 +118,10 @@ pub struct Store {
     pub links: HashMap<String, LinkPreview>,
     pub communities: HashMap<String, Community>,
     pub first_names: HashMap<String, String>,
+    /// Max message timestamp per thread stored before this session synced, used to forward-backfill gaps.
+    pub pre_sync_max_ts: HashMap<String, f64>,
+    /// Redirect map when an unprefixed / hybrid thread id merges into its canonical "e:<id>" thread.
+    pub merged_threads: HashMap<String, String>,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -138,6 +146,7 @@ impl Store {
     pub fn with_db(db: Option<Db>) -> Self {
         let mut st = Store::default();
         if let Some(db) = &db {
+            st.pre_sync_max_ts = db.max_message_ts_by_thread();
             for t in db.load_threads() {
                 st.threads.insert(t.id.clone(), t);
             }
@@ -163,7 +172,104 @@ impl Store {
         }
         st.stickers = db.as_ref().map(|d| d.load_stickers(60)).unwrap_or_default();
         st.db = db;
+        // Heal any split threads where an encrypted thread "e:<id>" also left rows under plain "<id>".
+        let e2ee_ids: Vec<String> = st.threads.keys().filter(|k| k.starts_with("e:")).cloned().collect();
+        for eid in e2ee_ids {
+            let raw = eid.trim_start_matches("e:").to_string();
+            st.merge_thread(&raw, &eid);
+        }
         st
+    }
+
+    pub fn canonical_thread(&self, th: &str) -> String {
+        if let Some(to) = self.merged_threads.get(th) {
+            return to.clone();
+        }
+        if !th.is_empty() && !th.starts_with("e:") {
+            let eid = format!("e:{th}");
+            if self.threads.contains_key(&eid) {
+                return eid;
+            }
+        }
+        th.to_string()
+    }
+
+    /// Merge a duplicate plain/hybrid thread into its canonical encrypted thread, preserving messages and metadata.
+    pub fn merge_thread(&mut self, from: &str, to: &str) {
+        if from.is_empty() || to.is_empty() || from == to {
+            return;
+        }
+        self.merged_threads.insert(from.to_string(), to.to_string());
+        if let Some(ts) = self.pre_sync_max_ts.remove(from) {
+            let e = self.pre_sync_max_ts.entry(to.to_string()).or_insert(0.0);
+            if ts > *e {
+                *e = ts;
+            }
+        }
+        if let Some(old_t) = self.threads.remove(from) {
+            let t = self.threads.entry(to.to_string()).or_default();
+            if t.id.is_empty() {
+                t.id = to.to_string();
+            }
+            if t.name.is_empty() && !old_t.name.is_empty() {
+                t.name = old_t.name;
+            }
+            if t.picture.is_empty() && !old_t.picture.is_empty() {
+                t.picture = old_t.picture;
+            }
+            if t.contact.is_none() {
+                t.contact = old_t.contact;
+            }
+            if t.folder.is_empty() && !old_t.folder.is_empty() {
+                t.folder = old_t.folder;
+                t.ttype = old_t.ttype;
+                t.parent = old_t.parent;
+            }
+            t.muted |= old_t.muted;
+            t.read_up_to = t.read_up_to.max(old_t.read_up_to);
+            t.synced_read_up_to = t.synced_read_up_to.max(old_t.synced_read_up_to);
+            if old_t.last_activity > t.last_activity {
+                t.last_activity = old_t.last_activity;
+                if !old_t.snippet.is_empty() {
+                    t.snippet = old_t.snippet;
+                }
+            }
+            if t.read_up_to > 0.0 && t.last_activity <= t.read_up_to + 999.0 {
+                t.unread = false;
+            } else if old_t.unread && old_t.last_activity > t.read_up_to + 999.0 {
+                t.unread = true;
+            }
+        }
+        if let Some(old_msgs) = self.messages.remove(from) {
+            if let Some(list) = self.messages.get_mut(to) {
+                for m in old_msgs {
+                    if !list.iter().any(|x| x.id == m.id) {
+                        list.push(m);
+                    }
+                }
+                list.sort_by(|a, b| a.ts.total_cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+            }
+        }
+        if let Some(db) = &self.db {
+            db.merge_threads(from, to);
+            if let Some(t) = self.threads.get(to) {
+                db.save_thread(t);
+            }
+        }
+    }
+
+    fn resolve_reply_text(&self, thread: &str, reply_id: &str) -> Option<String> {
+        if reply_id.is_empty() {
+            return None;
+        }
+        if let Some(list) = self.messages.get(thread) {
+            if let Some(m) = list.iter().find(|m| m.id == reply_id) {
+                if !m.text.is_empty() {
+                    return Some(m.text.clone());
+                }
+            }
+        }
+        self.db.as_ref().and_then(|d| d.find_message_text(reply_id))
     }
 
     /// Lazily load a thread's stored history the first time it is opened.
@@ -205,7 +311,7 @@ impl Store {
             }
         }
         if added > 0 {
-            list.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+            list.sort_by(|a, b| a.ts.total_cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
         }
         added
     }
@@ -237,17 +343,47 @@ impl Store {
                 }
             }
             "seen" => {
-                let (th, ts) = (s(ev, "thread"), f(ev, "ts"));
+                let th = self.canonical_thread(&s(ev, "thread"));
+                let ts = f(ev, "ts");
                 let e = self.seen.entry(th).or_insert(0.0);
                 if ts > *e {
                     *e = ts;
+                }
+            }
+            "read" => {
+                let th = self.canonical_thread(&s(ev, "thread"));
+                let rts = f(ev, "readUpTo");
+                if rts > 0.0 {
+                    if let Some(t) = self.threads.get_mut(&th) {
+                        t.read_up_to = t.read_up_to.max(rts);
+                        t.synced_read_up_to = t.synced_read_up_to.max(rts);
+                        if t.last_activity <= t.read_up_to + 999.0 {
+                            t.unread = false;
+                        }
+                        if let Some(db) = &self.db {
+                            db.save_thread(t);
+                        }
+                    }
+                }
+            }
+            "mergeThread" => {
+                let (from, to) = (s(ev, "from"), s(ev, "to"));
+                self.merge_thread(&from, &to);
+            }
+            "deleteThread" => {
+                let id = self.canonical_thread(&s(ev, "thread"));
+                self.threads.remove(&id);
+                self.messages.remove(&id);
+                if let Some(db) = &self.db {
+                    db.delete_thread(&id);
                 }
             }
             "exited" => self.exited = true,
             "error" => self.last_error = Some(s(ev, "msg")),
             "sendFailed" => {
                 // the message never left: drop its pending bubble and let the UI give the text back
-                let (tag, th) = (s(ev, "clientTag"), s(ev, "thread"));
+                let tag = s(ev, "clientTag");
+                let th = self.canonical_thread(&s(ev, "thread"));
                 self.last_error = Some(s(ev, "msg"));
                 if let Some(list) = self.messages.get_mut(&th) {
                     list.retain(|m| m.id != tag);
@@ -279,28 +415,128 @@ impl Store {
             "historyPage" => {
                 self.history_busy = false;
                 if !b(ev, "hasMore") {
-                    self.history_done.insert(s(ev, "thread"));
+                    self.history_done.insert(self.canonical_thread(&s(ev, "thread")));
                 }
             }
             "presence" => {
                 self.presence.insert(s(ev, "id"), b(ev, "online"));
             }
             "thread" => {
-                let id = s(ev, "id");
+                let raw_id = s(ev, "id");
+                let id = if raw_id.starts_with("e:") {
+                    let plain = raw_id.trim_start_matches("e:").to_string();
+                    self.merge_thread(&plain, &raw_id);
+                    if let Some(mf) = opt(ev, "mergeFrom") {
+                        self.merge_thread(&mf, &raw_id);
+                    }
+                    raw_id
+                } else {
+                    self.canonical_thread(&raw_id)
+                };
+                let is_partial = b(ev, "partial");
+                let from_lightspeed = ev.get("folder").is_some();
                 let t = self.threads.entry(id.clone()).or_default();
                 t.id = id;
-                t.name = s(ev, "name");
-                t.snippet = s(ev, "snippet");
-                t.picture = s(ev, "picture");
-                t.last_activity = f(ev, "lastActivity");
-                t.unread = b(ev, "unread");
-                t.muted = b(ev, "muted");
-                t.contact = opt(ev, "contact");
-                // encrypted-thread events carry no folder/type: keep what we had
-                if ev.get("folder").is_some() {
+                if is_partial {
+                    if ev.get("name").is_some() {
+                        let n = s(ev, "name");
+                        if !n.is_empty() {
+                            t.name = n;
+                        }
+                    }
+                    if ev.get("picture").is_some() {
+                        let p = s(ev, "picture");
+                        if !p.is_empty() {
+                            t.picture = p;
+                        }
+                    }
+                    if ev.get("muted").is_some() {
+                        t.muted = b(ev, "muted");
+                    }
+                    if ev.get("folder").is_some() {
+                        t.folder = s(ev, "folder");
+                    }
+                    if ev.get("parent").is_some() {
+                        t.parent = s(ev, "parent");
+                    }
+                    let pts = f(ev, "lastActivity");
+                    if pts > t.last_activity {
+                        t.last_activity = pts;
+                        let psnip = s(ev, "snippet");
+                        if !psnip.is_empty() {
+                            t.snippet = psnip;
+                        }
+                    }
+                    if ev.get("unread").is_some() && !b(ev, "unread") {
+                        t.unread = false;
+                        if pts > t.read_up_to {
+                            t.read_up_to = pts;
+                        }
+                    }
+                    if let Some(db) = &self.db {
+                        db.save_thread(t);
+                    }
+                    return;
+                }
+                let name = s(ev, "name");
+                if !name.is_empty() {
+                    t.name = name;
+                }
+                let pic = s(ev, "picture");
+                if !pic.is_empty() {
+                    t.picture = pic;
+                }
+                let ev_ts = f(ev, "lastActivity");
+                let snip = s(ev, "snippet");
+                if ev_ts >= t.last_activity || t.last_activity == 0.0 {
+                    if ev_ts > 0.0 {
+                        t.last_activity = ev_ts;
+                    }
+                    if !snip.is_empty() {
+                        t.snippet = snip;
+                    }
+                }
+                if ev.get("muted").is_some() {
+                    t.muted = b(ev, "muted");
+                }
+                if let Some(c) = opt(ev, "contact") {
+                    t.contact = Some(c);
+                }
+                // encrypted-thread events from WhatsApp carry no folder/type: keep what we had
+                if from_lightspeed {
                     t.folder = s(ev, "folder");
-                    t.ttype = ev.get("ttype").and_then(Value::as_i64).unwrap_or(0);
+                    t.ttype = ev.get("ttype").and_then(Value::as_i64).unwrap_or(t.ttype);
                     t.parent = s(ev, "parent");
+                }
+                let ev_unread = b(ev, "unread");
+                let ev_read_up_to = f(ev, "readUpTo");
+                if ev_read_up_to > t.synced_read_up_to {
+                    t.synced_read_up_to = ev_read_up_to;
+                }
+                if ev_read_up_to > t.read_up_to {
+                    t.read_up_to = ev_read_up_to;
+                }
+                if !ev_unread {
+                    if ev_ts > 0.0 {
+                        t.read_up_to = t.read_up_to.max(ev_ts);
+                        if from_lightspeed {
+                            t.synced_read_up_to = t.synced_read_up_to.max(ev_ts);
+                        }
+                    }
+                    if t.last_activity <= t.read_up_to + 999.0 {
+                        t.unread = false;
+                    }
+                } else {
+                    let check_ts = if ev_ts > 0.0 { ev_ts } else { t.last_activity };
+                    if t.read_up_to > 0.0 && check_ts <= t.read_up_to + 999.0 {
+                        // Already read locally; keep unread=false and mark server out-of-sync so App re-sends markReadServer.
+                        t.unread = false;
+                        if from_lightspeed && ev_read_up_to < t.read_up_to {
+                            t.synced_read_up_to = ev_read_up_to;
+                        }
+                    } else {
+                        t.unread = true;
+                    }
                 }
                 if let Some(db) = &self.db {
                     db.save_thread(t);
@@ -323,24 +559,28 @@ impl Store {
             }
             "participant" => {
                 // 1:1 threads: remember the other person so the thread can borrow name/avatar
-                let (th, c) = (s(ev, "thread"), s(ev, "contact"));
+                let th = self.canonical_thread(&s(ev, "thread"));
+                let c = s(ev, "contact");
                 if c != self.self_id && !c.is_empty() {
                     if let Some(t) = self.threads.get_mut(&th) {
-                        if t.contact.is_none() {
+                        let is_group = matches!(t.ttype, 2 | 8 | 11 | 16) || (t.ttype >= 17 && t.ttype <= 26);
+                        if t.contact.is_none() && !is_group {
                             t.contact = Some(c);
                         }
                     }
                 }
             }
             "message" => {
-                let thread = s(ev, "thread");
+                let thread = self.canonical_thread(&s(ev, "thread"));
+                let reply_text = opt(ev, "replyToText")
+                    .or_else(|| opt(ev, "replyToId").and_then(|rid| self.resolve_reply_text(&thread, &rid)));
                 let mut m = Message {
                     id: s(ev, "id"),
                     sender: s(ev, "sender"),
                     text: s(ev, "text"),
                     ts: f(ev, "ts"),
                     system: b(ev, "system"),
-                    reply_text: opt(ev, "replyToText"),
+                    reply_text,
                     ..Default::default()
                 };
                 // the media event usually arrives before its message
@@ -349,41 +589,69 @@ impl Store {
                     m.media_ref = Some(r.clone());
                 }
                 m.link = self.links.get(&m.id).cloned();
-                let from_other = m.sender != self.self_id;
+                let from_other = !self.self_id.is_empty() && m.sender != self.self_id;
                 if let Some(db) = &self.db {
                     db.save_message(&thread, &m);
                 }
-                let (live, text, sender) = (b(ev, "live"), m.text.clone(), m.sender.clone());
+                let (live, text, sender, msg_ts) = (b(ev, "live"), m.text.clone(), m.sender.clone(), m.ts);
+                // Own message (from this app or our phone) implies we have read up to msg_ts.
+                if !self.self_id.is_empty() && m.sender == self.self_id && msg_ts > 0.0 {
+                    if let Some(t) = self.threads.get_mut(&thread) {
+                        t.read_up_to = t.read_up_to.max(msg_ts);
+                        if t.last_activity <= t.read_up_to + 999.0 {
+                            t.unread = false;
+                        }
+                        if let Some(db) = &self.db {
+                            db.save_thread(t);
+                        }
+                    }
+                }
                 // the chat list preview and ordering follow the newest message
-                self.bump_preview(&thread, &sender, &text, f(ev, "ts"));
+                self.bump_preview(&thread, &sender, &text, msg_ts);
                 // Not opened yet: the DB copy is enough, history is loaded on open.
                 if let Some(list) = self.messages.get_mut(&thread) {
                     if let Some(old) = list.iter_mut().find(|x| x.id == m.id) {
                         let (r, mk, mr) = (std::mem::take(&mut old.reactions), old.media_kind.take(), old.media_ref.take());
                         let (nk, nr, nl) = (m.media_kind.clone(), m.media_ref.clone(), m.link.clone());
                         let old_link = old.link.take();
+                        let old_reply = old.reply_text.take();
+                        let old_text = std::mem::take(&mut old.text);
                         *old = m;
+                        if old.text.is_empty() && !old_text.is_empty() {
+                            old.text = old_text;
+                        }
+                        old.reply_text = old.reply_text.take().or(old_reply);
                         old.reactions = r;
                         old.media_kind = nk.or(mk);
                         old.media_ref = nr.or(mr);
                         old.link = nl.or(old_link);
                     } else {
                         list.push(m);
-                        list.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+                        list.sort_by(|a, b| a.ts.total_cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
                     }
                 }
                 if live && from_other {
-                    let muted = self.threads.get(&thread).map(|t| t.muted).unwrap_or(false);
-                    if let Some(t) = self.threads.get_mut(&thread) {
-                        t.unread = true;
-                    }
-                    if !muted && !text.is_empty() {
-                        let title = self
-                            .threads
-                            .get(&thread)
-                            .map(|t| self.display_name(t))
-                            .unwrap_or_else(|| self.sender_name(&sender));
-                        self.notifications.push((thread.clone(), title, text));
+                    let already_read = self
+                        .threads
+                        .get(&thread)
+                        .map(|t| t.read_up_to > 0.0 && msg_ts > 0.0 && msg_ts <= t.read_up_to + 999.0)
+                        .unwrap_or(false);
+                    if !already_read {
+                        let muted = self.threads.get(&thread).map(|t| t.muted).unwrap_or(false);
+                        if let Some(t) = self.threads.get_mut(&thread) {
+                            t.unread = true;
+                            if let Some(db) = &self.db {
+                                db.save_thread(t);
+                            }
+                        }
+                        if !muted && !text.is_empty() {
+                            let title = self
+                                .threads
+                                .get(&thread)
+                                .map(|t| self.display_name(t))
+                                .unwrap_or_else(|| self.sender_name(&sender));
+                            self.notifications.push((thread.clone(), title, text));
+                        }
                     }
                 }
             }
@@ -458,7 +726,8 @@ impl Store {
             }
             "sent" => {
                 // E2EE send reconciliation: swap the local-echo tag for the real id
-                let (tag, id, th) = (s(ev, "clientTag"), s(ev, "id"), s(ev, "thread"));
+                let (tag, id) = (s(ev, "clientTag"), s(ev, "id"));
+                let th = self.canonical_thread(&s(ev, "thread"));
                 if let Some(list) = self.messages.get_mut(&th) {
                     let real_exists = list.iter().any(|m| m.id == id);
                     if real_exists {
@@ -500,16 +769,18 @@ impl Store {
             "delete" => {
                 // by id across all threads: the thread key can differ between normal and E2EE forms
                 let id = s(ev, "id");
+                let prefix = format!("{id}#");
                 if let Some(db) = &self.db {
                     db.delete_message(&id);
                 }
-                self.media.remove(&id);
+                self.media.retain(|k, _| k != &id && !k.starts_with(&prefix));
                 for list in self.messages.values_mut() {
-                    list.retain(|m| m.id != id);
+                    list.retain(|m| m.id != id && !m.id.starts_with(&prefix));
                 }
             }
             "typing" => {
-                self.typing.insert(s(ev, "thread"), b(ev, "composing"));
+                let th = self.canonical_thread(&s(ev, "thread"));
+                self.typing.insert(th, b(ev, "composing"));
             }
             _ => {}
         }
@@ -525,7 +796,7 @@ impl Store {
         if ts <= t.last_activity {
             return;
         }
-        let group = !thread.starts_with("e:") && t.contact.is_none();
+        let group = t.contact.is_none();
         let snippet = if sender == self.self_id {
             format!("Bạn: {text}")
         } else if group {
@@ -587,5 +858,104 @@ impl Store {
             return "Bạn".into();
         }
         self.contacts.get(id).cloned().unwrap_or_else(|| id.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn read_watermark_survives_stale_server_reload_and_1s_wa_timestamps() {
+        let db = Db::open_memory().unwrap();
+        let mut st = Store::with_db(Some(db));
+        st.self_id = "999".into();
+
+        // Incoming unread E2EE thread from Lightspeed (ms precision)
+        st.apply(&json!({
+            "type": "thread", "id": "e:100", "name": "Alice",
+            "snippet": "hello", "lastActivity": 1700000005432.0,
+            "unread": true, "readUpTo": 1700000000000.0, "folder": "inbox"
+        }));
+        assert!(st.threads["e:100"].unread);
+
+        // User reads up to 1700000005000.0 (1-second truncated WhatsApp timestamp)
+        st.apply(&json!({"type": "read", "thread": "e:100", "readUpTo": 1700000005000.0}));
+        assert!(!st.threads["e:100"].unread, "999ms WA tolerance must clear unread");
+
+        // Server re-sends stale unread=true with old readUpTo=1700000000000 on restart
+        st.apply(&json!({
+            "type": "thread", "id": "e:100", "name": "Alice",
+            "snippet": "hello", "lastActivity": 1700000005432.0,
+            "unread": true, "readUpTo": 1700000000000.0, "folder": "inbox"
+        }));
+        let t = &st.threads["e:100"];
+        assert!(!t.unread, "already-read thread must stay read after restart");
+        assert!(t.read_up_to > t.synced_read_up_to + 999.0, "must flag server watermark as needing re-sync");
+    }
+
+    #[test]
+    fn split_plain_and_e2ee_threads_merge_without_losing_messages() {
+        let db = Db::open_memory().unwrap();
+        let mut st = Store::with_db(Some(db));
+        st.self_id = "999".into();
+
+        // Plain thread arrives before E2EE mapping is known
+        st.apply(&json!({
+            "type": "thread", "id": "100", "name": "Bob",
+            "snippet": "old", "lastActivity": 1000.0, "unread": false, "folder": "inbox"
+        }));
+        st.apply(&json!({
+            "type": "message", "id": "m1", "thread": "100", "sender": "100",
+            "text": "from plain", "ts": 1000.0, "live": false
+        }));
+
+        // E2EE thread arrives and merges plain "100" -> "e:100"
+        st.apply(&json!({
+            "type": "thread", "id": "e:100", "name": "",
+            "snippet": "encrypted", "lastActivity": 2000.0, "unread": true, "e2ee": true
+        }));
+        st.apply(&json!({
+            "type": "message", "id": "m2", "thread": "e:100", "sender": "100",
+            "text": "from e2ee", "ts": 2000.0, "live": true
+        }));
+
+        assert!(!st.threads.contains_key("100"));
+        assert_eq!(st.threads["e:100"].name, "Bob");
+        st.ensure_loaded("e:100");
+        let ids: Vec<&str> = st.messages["e:100"].iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2"]);
+    }
+
+    #[test]
+    fn same_timestamp_pagination_and_multipart_delete() {
+        let db = Db::open_memory().unwrap();
+        let mut st = Store::with_db(Some(db));
+        st.self_id = "999".into();
+
+        for i in 0..5 {
+            st.apply(&json!({
+                "type": "message",
+                "id": format!("m{i}"),
+                "thread": "t1",
+                "sender": "100",
+                "text": format!("msg {i}"),
+                "ts": 5000.0, // identical 1-second timestamp
+                "live": false
+            }));
+        }
+        // Load only 2 newest, then paginate older from DB at boundary ts=5000.0
+        let initial = st.db.as_ref().unwrap().load_messages("t1", 2);
+        st.messages.insert("t1".into(), initial);
+        let added = st.load_older_from_db("t1");
+        assert_eq!(added, 3, "messages sharing boundary timestamp must not be skipped");
+        assert_eq!(st.messages["t1"].len(), 5);
+
+        // Multi-part gallery message deletion removes all #k children
+        st.apply(&json!({"type": "message", "id": "gal", "thread": "t1", "sender": "100", "text": "📷 Photo", "ts": 6000.0}));
+        st.apply(&json!({"type": "message", "id": "gal#1", "thread": "t1", "sender": "100", "text": "📷 Photo", "ts": 6000.001}));
+        st.apply(&json!({"type": "delete", "id": "gal"}));
+        assert!(!st.messages["t1"].iter().any(|m| m.id.starts_with("gal")));
     }
 }

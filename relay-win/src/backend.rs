@@ -78,8 +78,8 @@ impl Backend {
     pub fn send_text(&mut self, thread: &str, text: &str, tag: &str) {
         self.send(json!({"cmd": "send", "thread": thread, "text": text, "clientTag": tag}));
     }
-    pub fn refresh_thread(&mut self, thread: &str) {
-        self.send(json!({"cmd": "refreshThread", "thread": thread}));
+    pub fn refresh_thread(&mut self, thread: &str, since_ts: i64) {
+        self.send(json!({"cmd": "refreshThread", "thread": thread, "sinceTs": since_ts}));
     }
 }
 
