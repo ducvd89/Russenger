@@ -2,6 +2,9 @@
 //! built-in player. Started by the app with the target as the only argument.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[path = "../paths.rs"]
+mod paths;
+
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -17,8 +20,7 @@ fn icon() -> Option<tao::window::Icon> {
 }
 
 fn data_dir() -> std::path::PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("Relay").join("webview-player")
+    paths::data_dir().join("webview-player")
 }
 
 fn main() {
@@ -44,7 +46,7 @@ fn main() {
         // direct media URLs open in WebView2's built-in player; start it right away
         .with_initialization_script("document.addEventListener('DOMContentLoaded',function(){var v=document.querySelector('video,audio');if(v){v.play().catch(function(){});}});")
         .build(&window)
-        .expect("webview (is the WebView2 runtime installed?)");
+        .expect("media player webview");
 
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;

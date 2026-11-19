@@ -67,6 +67,8 @@ pub struct Message {
     pub ts: f64,
     pub system: bool,
     pub reply_text: Option<String>,
+    pub reply_id: Option<String>,
+    pub reply_ts: f64,
     pub media_kind: Option<String>,
     /// http(s) URL or a local file path
     pub media_ref: Option<String>,
@@ -76,6 +78,7 @@ pub struct Message {
 }
 
 pub const PAGE: usize = 200;
+pub const DAY_MS: f64 = 86_400_000.0;
 
 /// Placeholder texts the helper uses for attachment-only messages.
 pub fn is_placeholder(text: &str) -> bool {
@@ -304,7 +307,11 @@ impl Store {
     /// Lazily load a thread's stored history and known participants the first time it is opened.
     pub fn ensure_loaded(&mut self, thread: &str) {
         if !self.messages.contains_key(thread) {
-            let list = self.db.as_ref().map(|d| d.load_messages(thread, PAGE)).unwrap_or_default();
+            let mut list = self.db.as_ref().map(|d| d.load_messages(thread, PAGE)).unwrap_or_default();
+            let cutoff = chrono::Utc::now().timestamp_millis() as f64 - 7.0 * DAY_MS;
+            if list.last().is_some_and(|message| message.ts >= cutoff) {
+                list.retain(|message| message.ts >= cutoff);
+            }
             let list = self.decorate(thread, list);
             self.messages.insert(thread.to_string(), list);
         }
@@ -382,36 +389,55 @@ impl Store {
 
     /// Attach pictures, link cards and reactions kept outside the message rows.
     fn decorate(&self, thread: &str, mut list: Vec<Message>) -> Vec<Message> {
-        let reactions = self.db.as_ref().map(|d| d.load_reactions(thread)).unwrap_or_default();
+        let mut reactions = HashMap::<String, Vec<(String, String)>>::new();
+        if let Some(db) = &self.db {
+            for (message, actor, emoji) in db.load_reactions(thread) {
+                reactions.entry(message).or_default().push((actor, emoji));
+            }
+        }
         for m in list.iter_mut() {
             if let Some((k, r)) = self.media.get(&m.id) {
                 m.media_kind = Some(k.clone());
                 m.media_ref = Some(r.clone());
             }
             m.link = self.links.get(&m.id).cloned();
-            m.reactions = reactions.iter().filter(|(id, _, _)| *id == m.id).map(|(_, a, e)| (a.clone(), e.clone())).collect();
+            m.reactions = reactions.remove(&m.id).unwrap_or_default();
         }
         list
     }
 
-    /// Show one more page of already stored older messages. Returns how many were added
-    /// (0 = the stored history is used up and the server has to be asked).
-    pub fn load_older_from_db(&mut self, thread: &str) -> usize {
-        let Some(oldest) = self.messages.get(thread).and_then(|l| l.iter().filter(|m| !m.pending).map(|m| m.ts).reduce(f64::min)) else { return 0 };
-        let older = self.db.as_ref().map(|d| d.load_messages_before(thread, oldest, PAGE)).unwrap_or_default();
-        let older = self.decorate(thread, older);
-        let list = self.messages.entry(thread.to_string()).or_default();
-        let mut added = 0;
-        for m in older {
-            if !list.iter().any(|x| x.id == m.id) {
-                list.push(m);
-                added += 1;
+    pub fn load_cached_history(&mut self, thread: &str, after: f64, before: f64) -> usize {
+        let messages = self.db.as_ref()
+            .map(|db| db.load_messages_in_range(thread, after, before, 10_000))
+            .unwrap_or_default();
+        self.merge_cached_messages(thread, messages)
+    }
+
+    pub fn reveal_quoted_message(&mut self, thread: &str, reply: &Message) -> Option<String> {
+        let id = reply.reply_id.clone().or_else(|| self.db.as_ref()?.unique_quoted_id(thread, reply, reply.reply_text.as_deref()?))?;
+        if !self.messages.get(thread).is_some_and(|list| list.iter().any(|message| message.id == id)) {
+            let db = self.db.as_ref()?;
+            let original = db.load_message(thread, &id)?;
+            let mut messages = db.load_messages_before(thread, original.ts, PAGE / 2);
+            if !messages.iter().any(|message| message.id == id) {
+                messages.push(original);
             }
+            self.merge_cached_messages(thread, messages);
         }
-        if added > 0 {
+        self.messages.get(thread)?.iter().any(|message| message.id == id).then_some(id)
+    }
+
+    fn merge_cached_messages(&mut self, thread: &str, messages: Vec<Message>) -> usize {
+        let messages = self.decorate(thread, messages);
+        let list = self.messages.entry(thread.to_string()).or_default();
+        let old_count = list.len();
+        let existing: std::collections::HashSet<_> = list.iter().map(|message| message.id.as_str()).collect();
+        let new_messages: Vec<_> = messages.into_iter().filter(|message| !existing.contains(message.id.as_str())).collect();
+        list.extend(new_messages);
+        if list.len() > old_count {
             list.sort_by(|a, b| a.ts.total_cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
         }
-        added
+        list.len() - old_count
     }
 
     pub fn apply(&mut self, ev: &Value) {
@@ -558,7 +584,13 @@ impl Store {
                     if ev.get("parent").is_some() {
                         t.parent = s(ev, "parent");
                     }
+                    if let Some(contact) = opt(ev, "contact") {
+                        t.contact = Some(contact);
+                    }
                     let pts = f(ev, "lastActivity");
+                    let remote_read = f(ev, "readUpTo");
+                    t.read_up_to = t.read_up_to.max(remote_read);
+                    t.synced_read_up_to = t.synced_read_up_to.max(remote_read);
                     if pts > t.last_activity {
                         t.last_activity = pts;
                         let psnip = s(ev, "snippet");
@@ -566,10 +598,16 @@ impl Store {
                             t.snippet = psnip;
                         }
                     }
-                    if ev.get("unread").is_some() && !b(ev, "unread") {
-                        t.unread = false;
-                        if pts > t.read_up_to {
-                            t.read_up_to = pts;
+                    if let Some(unread) = ev.get("unread").and_then(Value::as_bool) {
+                        if unread {
+                            if pts > 0.0 && pts >= t.last_activity {
+                                t.unread = t.read_up_to == 0.0 || pts > t.read_up_to + 999.0;
+                            }
+                        } else {
+                            t.read_up_to = t.read_up_to.max(pts);
+                            if pts == 0.0 || t.last_activity <= t.read_up_to + 999.0 {
+                                t.unread = false;
+                            }
                         }
                     }
                     if let Some(db) = &self.db {
@@ -588,11 +626,11 @@ impl Store {
                 let ev_ts = f(ev, "lastActivity");
                 let snip = s(ev, "snippet");
                 if ev_ts >= t.last_activity || t.last_activity == 0.0 {
+                    if !snip.is_empty() && (ev_ts > t.last_activity || t.snippet.is_empty()) {
+                        t.snippet = snip;
+                    }
                     if ev_ts > 0.0 {
                         t.last_activity = ev_ts;
-                    }
-                    if !snip.is_empty() {
-                        t.snippet = snip;
                     }
                 }
                 if ev.get("muted").is_some() {
@@ -687,8 +725,9 @@ impl Store {
             }
             "message" => {
                 let thread = self.canonical_thread(&s(ev, "thread"));
+                let reply_id = opt(ev, "replyToId");
                 let reply_text = opt(ev, "replyToText")
-                    .or_else(|| opt(ev, "replyToId").and_then(|rid| self.resolve_reply_text(&thread, &rid)));
+                    .or_else(|| reply_id.as_deref().and_then(|id| self.resolve_reply_text(&thread, id)));
                 let mut m = Message {
                     id: s(ev, "id"),
                     sender: s(ev, "sender"),
@@ -696,6 +735,8 @@ impl Store {
                     ts: f(ev, "ts"),
                     system: b(ev, "system"),
                     reply_text,
+                    reply_id,
+                    reply_ts: f(ev, "replyToTs"),
                     ..Default::default()
                 };
                 if !m.system && !m.sender.is_empty() {
@@ -705,6 +746,17 @@ impl Store {
                 if let Some((k, r)) = self.media.get(&m.id) {
                     m.media_kind = Some(k.clone());
                     m.media_ref = Some(r.clone());
+                } else if let Some(sticker) = opt(ev, "stickerId") {
+                    let picture = self.stickers.iter().find(|(id, _)| id == &sticker).map(|(_, url)| url.clone())
+                        .or_else(|| self.db.as_ref()?.sticker_url(&sticker));
+                    if let Some(picture) = picture {
+                        m.media_kind = Some("sticker".into());
+                        m.media_ref = Some(picture.clone());
+                        self.media.insert(m.id.clone(), ("sticker".into(), picture.clone()));
+                        if let Some(db) = &self.db {
+                            db.set_media(&m.id, "sticker", &picture);
+                        }
+                    }
                 }
                 m.link = self.links.get(&m.id).cloned();
                 let from_other = !self.self_id.is_empty() && m.sender != self.self_id;
@@ -712,6 +764,16 @@ impl Store {
                     db.save_message(&thread, &m);
                 }
                 let (live, text, sender, msg_ts) = (b(ev, "live"), m.text.clone(), m.sender.clone(), m.ts);
+                // A pushed message can precede the corresponding thread metadata.
+                if !thread.is_empty() && !self.threads.contains_key(&thread)
+                    && !m.system && msg_ts >= chrono::Utc::now().timestamp_millis() as f64 - DAY_MS
+                {
+                    let mut provisional = Thread { id: thread.clone(), ..Default::default() };
+                    if thread.starts_with("e:") {
+                        provisional.contact = opt(ev, "contact");
+                    }
+                    self.threads.insert(thread.clone(), provisional);
+                }
                 // Own message (from this app or our phone) implies we have read up to msg_ts.
                 if !self.self_id.is_empty() && m.sender == self.self_id && msg_ts > 0.0 {
                     if let Some(t) = self.threads.get_mut(&thread) {
@@ -733,19 +795,25 @@ impl Store {
                         let (nk, nr, nl) = (m.media_kind.clone(), m.media_ref.clone(), m.link.clone());
                         let old_link = old.link.take();
                         let old_reply = old.reply_text.take();
+                        let old_reply_id = old.reply_id.take();
+                        let old_reply_ts = old.reply_ts;
                         let old_text = std::mem::take(&mut old.text);
                         *old = m;
                         if old.text.is_empty() && !old_text.is_empty() {
                             old.text = old_text;
                         }
                         old.reply_text = old.reply_text.take().or(old_reply);
+                        old.reply_id = old.reply_id.take().or(old_reply_id);
+                        if old.reply_ts <= 0.0 {
+                            old.reply_ts = old_reply_ts;
+                        }
                         old.reactions = r;
                         old.media_kind = nk.or(mk);
                         old.media_ref = nr.or(mr);
                         old.link = nl.or(old_link);
                     } else {
-                        list.push(m);
-                        list.sort_by(|a, b| a.ts.total_cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+                        let idx = list.partition_point(|old| old.ts.total_cmp(&m.ts).then_with(|| old.id.cmp(&m.id)).is_lt());
+                        list.insert(idx, m);
                     }
                 }
                 if live && from_other {
@@ -911,7 +979,10 @@ impl Store {
             return;
         }
         let Some(t) = self.threads.get(thread) else { return };
-        if ts <= t.last_activity {
+        // Encrypted messages often have second-precision timestamps while the
+        // inbox metadata uses milliseconds. Accept the matching preview.
+        let tolerance = if thread.starts_with("e:") { 999.0 } else { 0.0 };
+        if ts <= 0.0 || ts + tolerance < t.last_activity {
             return;
         }
         let group = t.contact.is_none();
@@ -929,7 +1000,7 @@ impl Store {
             text.to_string()
         };
         if let Some(t) = self.threads.get_mut(thread) {
-            t.last_activity = ts;
+            t.last_activity = t.last_activity.max(ts);
             t.snippet = snippet;
             if let Some(db) = &self.db {
                 db.save_thread(t);
@@ -963,12 +1034,9 @@ impl Store {
         self.contacts.get(&key).cloned().unwrap_or(key)
     }
 
-    pub fn thread_avatar(&self, t: &Thread) -> Option<String> {
-        if !t.picture.is_empty() {
-            return Some(t.picture.clone());
-        }
-        let key = t.contact.clone().unwrap_or_else(|| t.id.trim_start_matches("e:").to_string());
-        self.avatars.get(&key).cloned()
+    pub fn thread_contact_avatar(&self, t: &Thread) -> Option<&str> {
+        let key = t.contact.as_deref().unwrap_or_else(|| t.id.trim_start_matches("e:"));
+        self.avatars.get(key).map(String::as_str)
     }
 
     pub fn sender_name(&self, id: &str) -> String {
@@ -983,6 +1051,56 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn restores_sticker_attachment_from_the_catalog() {
+        let db = Db::open_memory().unwrap();
+        let url = "https://cdn.example.invalid/sticker.png";
+        db.save_sticker("123", url, 100.0);
+        let mut st = Store::with_db(Some(db));
+        st.apply(&json!({
+            "type": "message", "id": "msg", "thread": "chat",
+            "text": "💟 Sticker", "stickerId": "123", "ts": 100,
+        }));
+        let cached = st.db.as_ref().unwrap().load_message("chat", "msg").unwrap();
+        assert_eq!(cached.media_kind.as_deref(), Some("sticker"));
+        assert_eq!(cached.media_ref.as_deref(), Some(url));
+    }
+
+    #[test]
+    fn inbox_follows_messages_from_another_device() {
+        let mut st = Store::with_db(Some(Db::open_memory().unwrap()));
+        st.self_id = "me".into();
+        let now = chrono::Utc::now().timestamp_millis();
+        st.apply(&json!({"type":"message","id":"first","thread":"123","sender":"me","text":"Sent today","ts":now}));
+        assert_eq!(st.threads["123"].snippet, "Bạn: Sent today");
+        st.apply(&json!({"type":"thread","id":"123","name":"A chat","lastActivity":now-1,"snippet":"Old preview","folder":"inbox"}));
+        assert_eq!(st.threads["123"].snippet, "Bạn: Sent today");
+        assert_eq!(st.threads["123"].name, "A chat");
+
+        st.apply(&json!({"type":"thread","id":"e:456","partial":true,"contact":"456","lastActivity":now,"readUpTo":now-2000,"unread":true}));
+        st.apply(&json!({"type":"message","id":"second","thread":"e:456","sender":"me","text":"Encrypted send","ts":now-500}));
+        assert_eq!(st.threads["e:456"].last_activity, now as f64);
+        assert_eq!(st.threads["e:456"].snippet, "Bạn: Encrypted send");
+        assert!(!st.threads["e:456"].unread);
+    }
+
+    #[test]
+    fn opens_cached_quote_by_id_after_reloading() {
+        let db = Db::open_memory().unwrap();
+        let mut st = Store::with_db(Some(db));
+        st.apply(&json!({"type":"message","thread":"1","id":"original","text":"Same text","ts":1_000}));
+        st.apply(&json!({"type":"message","thread":"1","id":"another","text":"Same text","ts":2_000}));
+        st.apply(&json!({
+            "type":"message","thread":"1","id":"reply","text":"Reply","ts":3_000,
+            "replyToText":"Same text","replyToId":"original","replyToTs":1_000,
+        }));
+        let reply = st.db.as_ref().unwrap().load_message("1", "reply").unwrap();
+        assert_eq!(reply.reply_ts, 1_000.0);
+        assert_eq!(st.reveal_quoted_message("1", &reply).as_deref(), Some("original"));
+        let legacy = Message { reply_id: None, ..reply };
+        assert!(st.reveal_quoted_message("1", &legacy).is_none());
+    }
 
     #[test]
     fn read_watermark_survives_stale_server_reload_and_1s_wa_timestamps() {
@@ -1066,7 +1184,7 @@ mod tests {
         // Load only 2 newest, then paginate older from DB at boundary ts=5000.0
         let initial = st.db.as_ref().unwrap().load_messages("t1", 2);
         st.messages.insert("t1".into(), initial);
-        let added = st.load_older_from_db("t1");
+        let added = st.load_cached_history("t1", 0.0, 5000.0);
         assert_eq!(added, 3, "messages sharing boundary timestamp must not be skipped");
         assert_eq!(st.messages["t1"].len(), 5);
 

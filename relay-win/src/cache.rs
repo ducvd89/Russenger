@@ -174,7 +174,7 @@ fn schedule(url: &str, k: String, dir: PathBuf, max: u64, default_ext: &'static 
             return; // already on its way, or far too much is queued: it is asked for again later
         }
         // a link that just failed is not tried again at once (it would be retried on every frame)
-        if let Some(at) = FAILED.lock().unwrap().as_ref().and_then(|m| m.get(&k)) {
+        if let Some(at) = FAILED.lock().unwrap().as_ref().and_then(|m| m.get(url)) {
             if at.elapsed() < Duration::from_secs(60) {
                 return;
             }
@@ -189,7 +189,12 @@ fn run(job: Job) {
     {
         let fetched = fetch(&url, max);
         if fetched.is_err() {
-            FAILED.lock().unwrap().get_or_insert_with(HashMap::new).insert(k.clone(), Instant::now());
+            let mut failures = FAILED.lock().unwrap();
+            let failures = failures.get_or_insert_with(HashMap::new);
+            if failures.len() >= 2048 {
+                failures.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+            }
+            failures.insert(url.clone(), Instant::now());
         }
         if let Ok(data) = fetched {
             let ext = ext_of(&data, &url, default_ext);

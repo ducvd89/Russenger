@@ -65,6 +65,14 @@ func emit(obj map[string]any) {
 	os.Stdout.Write([]byte("\n"))
 }
 
+func dataDir() string {
+	if dir := os.Getenv("RELAY_DATA_DIR"); dir != "" {
+		return dir
+	}
+	dir, _ := os.UserConfigDir()
+	return filepath.Join(dir, "Relay")
+}
+
 func main() {
 	// the libraries log protocol rows (with message data) at warning level: keep errors only
 	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
@@ -142,6 +150,11 @@ func main() {
 			if thread != "" && path != "" {
 				sendQ <- func() { sendMediaMessage(thread, path, caption) }
 			}
+		case "resolveThreadAvatar":
+			thread, _ := m["thread"].(string)
+			picture, _ := m["picture"].(string)
+			contact, _ := m["contact"].(string)
+			go resolveThreadAvatar(thread, picture, contact)
 		case "loadMoreThreads":
 			// the app knows the oldest chat it has stored; start the next page after it
 			if k := toInt64(m["refKey"]); k != 0 {
@@ -156,7 +169,8 @@ func main() {
 		case "sendSticker":
 			thread, _ := m["thread"].(string)
 			if id := toInt64(m["stickerId"]); thread != "" && id != 0 {
-				sendQ <- func() { sendSticker(thread, id) }
+				picture, _ := m["picture"].(string)
+				sendQ <- func() { sendSticker(thread, id, picture) }
 			}
 		case "sendGif":
 			thread, _ := m["thread"].(string)
@@ -170,6 +184,16 @@ func main() {
 				sinceTs := toInt64(m["sinceTs"])
 				go refreshThread(thread, sinceTs)
 			}
+		case "syncOpenHistory":
+			if thread, _ := m["thread"].(string); thread != "" {
+				beforeID, _ := m["beforeId"].(string)
+				older, _ := m["older"].(bool)
+				go syncOpenHistory(thread, beforeID, toInt64(m["beforeTs"]), older)
+			}
+		case "fetchQuote":
+			thread, _ := m["thread"].(string)
+			id, _ := m["id"].(string)
+			go fetchQuotedMessage(thread, id, toInt64(m["ts"]))
 		case "react":
 			thread, _ := m["thread"].(string)
 			id, _ := m["id"].(string)
@@ -266,7 +290,8 @@ func main() {
 		case "loadEncryptedHistory":
 			thread, _ := m["thread"].(string)
 			if thread != "" {
-				go loadEncryptedHistory(thread, toInt64(m["before"]))
+				window, _ := m["window"].(bool)
+				go loadEncryptedHistory(thread, toInt64(m["before"]), window)
 			}
 		case "loadEarlier":
 			// App asks for older messages before the oldest one it has in a thread.
@@ -337,6 +362,7 @@ func connect(cookieStr string) error {
 		return err
 	}
 	emit(map[string]any{"type": "ready", "self": selfFBID})
+	go watchRecentInbox()
 	// the first sync only carries the newest chats; the app asks for older pages once it has
 	// told us where its stored list ends (command loadMoreThreads)
 
@@ -802,7 +828,6 @@ func processTable(tbl *table.LSTable, live bool) {
 
 	for _, rng := range tbl.LSInsertNewMessageRange {
 		activeThreads[rng.ThreadKey] = true
-		noteMessageRange(rng)
 	}
 	for _, mg := range pendingMerges {
 		if mg[0] != "" && mg[1] != "" && mg[0] != mg[1] {
@@ -824,10 +849,10 @@ func processTable(tbl *table.LSTable, live bool) {
 		})
 	}
 	for _, ct := range tbl.LSDeleteThenInsertContact {
-		emitContact(ct.Id, ct.Name, ct.FirstName, ct.ProfilePictureUrl)
+		emitContact(ct.Id, ct.Name, ct.FirstName, firstNonEmpty(ct.ProfilePictureUrl, ct.ProfilePictureFallbackUrl))
 	}
 	for _, ct := range tbl.LSVerifyContactRowExists {
-		emitContact(ct.ContactId, ct.Name, ct.FirstName, ct.ProfilePictureUrl)
+		emitContact(ct.ContactId, ct.Name, ct.FirstName, firstNonEmpty(ct.ProfilePictureUrl, ct.ProfilePictureFallbackUrl))
 	}
 	for _, p := range tbl.LSAddParticipantIdToGroupThread {
 		emit(map[string]any{
@@ -968,7 +993,9 @@ func processTable(tbl *table.LSTable, live bool) {
 		metaMu.Unlock()
 
 		noteThreadWatermark(id, readWm, lastAct)
-		if pic == "" {
+		if !strings.HasPrefix(pic, "https://") && strings.HasPrefix(picFallback, "https://") {
+			pic = picFallback
+		} else if pic == "" {
 			pic = picFallback
 		}
 		folder := normalizeFolder(folderName)
@@ -1018,6 +1045,21 @@ func processTable(tbl *table.LSTable, live bool) {
 			th.MuteExpireTimeMs, th.ParentThreadKey, th.ThreadType,
 		)
 	}
+	for _, hybrid := range tbl.LSVerifyHybridThreadExists {
+		if hybrid.ThreadJID == 0 || hybrid.LastActivityTimestampMS <= 0 {
+			continue
+		}
+		id := "e:" + fmtID(hybrid.ThreadJID)
+		event := map[string]any{
+			"type": "thread", "id": id, "partial": true,
+			"lastActivity": hybrid.LastActivityTimestampMS, "readUpTo": hybrid.LastReadWatermarkTimestampMS,
+			"unread": hybrid.LastActivityTimestampMS > hybrid.LastReadWatermarkTimestampMS,
+		}
+		if !hybrid.IsGroupThread && hybrid.ThreadType != table.ENCRYPTED_OVER_WA_GROUP {
+			event["contact"] = fmtID(hybrid.ThreadJID)
+		}
+		emit(event)
+	}
 	for _, u := range tbl.LSSyncUpdateThreadName {
 		name := u.ThreadName
 		if name == "" {
@@ -1028,10 +1070,7 @@ func processTable(tbl *table.LSTable, live bool) {
 		}
 	}
 	for _, u := range tbl.LSSetThreadImageURL {
-		pic := u.ImageURL
-		if pic == "" {
-			pic = u.ImageFallbackURL
-		}
+		pic := firstNonEmpty(u.ImageURL, u.ImageFallbackURL)
 		if u.ThreadKey != 0 && pic != "" {
 			emit(map[string]any{"type": "thread", "id": emitThreadID(u.ThreadKey), "partial": true, "picture": pic})
 		}
@@ -1218,22 +1257,26 @@ func processTable(tbl *table.LSTable, live bool) {
 		})
 	}
 	for _, a := range tbl.LSInsertStickerAttachment {
-		url := a.PlayableUrl
-		if url == "" {
-			url = a.PreviewUrl
+		picture := firstNonEmpty(a.PreviewUrl, a.ImageUrl, a.PreviewUrlFallback, a.ImageUrlFallback)
+		if strings.HasPrefix(a.PlayableUrlMimeType, "image/") && a.PlayableUrl != "" {
+			picture = a.PlayableUrl
 		}
-		if url == "" {
-			url = a.ImageUrl
-		}
-		if a.MessageId != "" && url != "" {
-			noteSticker(a.MessageId, a.TargetId, url, false)
-			emit(map[string]any{"type": "media", "id": a.MessageId, "thread": emitThreadID(a.ThreadKey), "kind": "sticker", "url": url})
+		if a.MessageId != "" && picture != "" {
+			noteSticker(a.MessageId, a.TargetId, picture, false)
+			emitStickerPicture(a.MessageId, emitThreadID(a.ThreadKey), picture)
 		}
 	}
+	for _, replacement := range tbl.LSReplaceOptimsiticMessage {
+		attachSentSticker(replacement.OfflineThreadingId, replacement.MessageId, "")
+	}
 
-	emitMsg := func(id string, thread, sender, ts, stickerID int64, text string, system bool, replyID, replyText, replySnippet string, replyTo int64) {
+	emitMsg := func(id, otid string, thread, sender, ts, stickerID int64, text string, system bool, replyID, replyText, replySnippet string, replyTo, replyTs int64) {
 		if id == "" {
 			return
+		}
+		sentStickerID := attachSentSticker(otid, id, emitThreadID(thread))
+		if stickerID == 0 {
+			stickerID = sentStickerID
 		}
 		if text == "" {
 			text = getAttachLabel(id)
@@ -1253,8 +1296,14 @@ func processTable(tbl *table.LSTable, live bool) {
 			"type": "message", "id": id, "thread": thID, "sender": fmtID(sender),
 			"text": text, "ts": ts, "live": live, "system": system,
 		}
+		if stickerID > 0 && likeText(stickerID, "") == "" {
+			ev["stickerId"] = fmtID(stickerID)
+		}
 		if replyID != "" {
 			ev["replyToId"] = replyID
+			if replyTs > 0 {
+				ev["replyToTs"] = replyTs
+			}
 			quoted := replyText
 			if quoted == "" {
 				quoted = replySnippet
@@ -1279,8 +1328,8 @@ func processTable(tbl *table.LSTable, live bool) {
 			continue
 		}
 		noteSticker(m.MessageId, m.StickerId, "", true)
-		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
-			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId)
+		emitMsg(m.MessageId, m.OfflineThreadingId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
+			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId, m.ReplySourceTimestampMs)
 	}
 	for _, m := range tbl.LSUpsertMessage {
 		if m.IsUnsent {
@@ -1288,8 +1337,8 @@ func processTable(tbl *table.LSTable, live bool) {
 			continue
 		}
 		noteSticker(m.MessageId, m.StickerId, "", true)
-		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
-			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId)
+		emitMsg(m.MessageId, m.OfflineThreadingId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
+			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId, m.ReplySourceTimestampMs)
 	}
 	for _, m := range tbl.LSDeleteThenInsertMessage {
 		if m.IsUnsent {
@@ -1297,8 +1346,11 @@ func processTable(tbl *table.LSTable, live bool) {
 			continue
 		}
 		noteSticker(m.MessageId, m.StickerId, "", true)
-		emitMsg(m.MessageId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
-			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId)
+		emitMsg(m.MessageId, m.OfflineThreadingId, m.ThreadKey, m.SenderId, m.TimestampMs, m.StickerId, likeText(m.StickerId, m.Text), m.IsAdminMessage,
+			m.ReplySourceId, m.ReplyMessageText, m.ReplySnippet, m.ReplyToUserId, m.ReplySourceTimestampMs)
+	}
+	for _, rng := range tbl.LSInsertNewMessageRange {
+		noteMessageRange(rng)
 	}
 }
 
@@ -1853,6 +1905,11 @@ func fetchContact(id int64) {
 	requestedContactsMu.Unlock()
 }
 
+const (
+	recentHistoryWindow = 7 * 24 * time.Hour
+	olderHistoryWindow  = 3 * 24 * time.Hour
+)
+
 var refreshLocks sync.Map // string -> *sync.Mutex
 
 func threadRefreshLock(threadStr string) *sync.Mutex {
@@ -1901,54 +1958,152 @@ func refreshThread(threadStr string, sinceTs int64) {
 		return
 	}
 
-	sg := syncGroupFor(tid)
-	cursorDB := cursorDBFor(sg)
-	_, gen0 := getLastRange(tid)
-	tasks := []socket.Task{
-		&socket.CreateThreadTask{
-			ThreadFBID: tid,
-			SyncGroup:  int(sg),
-		},
-		&socket.FetchMessagesTask{
-			ThreadKey:            tid,
-			Direction:            0,
-			ReferenceTimestampMs: time.Now().UnixMilli() + 60_000,
-			ReferenceMessageId:   "",
-			SyncGroup:            sg,
-			Cursor:               client.GetCursor(cursorDB),
-		},
+	maxPages := 1
+	if sinceTs > 0 {
+		maxPages = 12
+		sinceTs = max(sinceTs, time.Now().Add(-recentHistoryWindow).UnixMilli())
 	}
-	if _, err := runTasks(context.Background(), tasks...); err != nil {
+	if _, _, _, _, err := fetchOpenHistory(tid, sinceTs, maxPages, nil); err != nil {
 		log.Warn().Err(err).Int64("thread", tid).Msg("refreshThread failed")
+	}
+}
+
+func syncOpenHistory(thread, beforeID string, beforeTs int64, older bool) {
+	result := map[string]any{"type": "openHistorySync", "thread": thread, "older": older}
+	tid := toInt64(thread)
+	if tid <= 0 || client == nil {
+		result["state"] = "error"
+		emit(result)
 		return
 	}
 
-	// Forward gap-fill: if the local DB had messages up to `sinceTs`, keep walking
-	// backwards (bounded to 5 pages) until the fetched range reaches `sinceTs`.
-	if sinceTs > 0 {
-		for page := 0; page < 5; page++ {
-			waitForRangeUpdate(tid, gen0, 2500*time.Millisecond)
-			rng, gen1 := getLastRange(tid)
-			if rng == nil || gen1 == gen0 {
-				break
-			}
-			gen0 = gen1
-			if !rng.HasMoreBefore || rng.MinMessageId == "" || rng.MinTimestampMs <= sinceTs {
-				break
-			}
-			nextTask := &socket.FetchMessagesTask{
-				ThreadKey:            tid,
-				Direction:            0,
-				ReferenceTimestampMs: rng.MinTimestampMs,
-				ReferenceMessageId:   rng.MinMessageId,
-				SyncGroup:            sg,
-				Cursor:               client.GetCursor(cursorDB),
-			}
-			if _, err := runTasks(context.Background(), nextTask); err != nil {
-				break
-			}
+	mu := threadRefreshLock(thread)
+	mu.Lock()
+	defer mu.Unlock()
+
+	cutoff := time.Now().Add(-recentHistoryWindow).UnixMilli()
+	if older {
+		base := time.Now()
+		if beforeTs > 0 {
+			base = time.UnixMilli(beforeTs)
 		}
+		cutoff = base.Add(-olderHistoryWindow).UnixMilli()
 	}
+	var before *table.LSInsertNewMessageRange
+	if beforeID != "" && beforeTs > cutoff {
+		before = &table.LSInsertNewMessageRange{MinMessageId: beforeID, MinTimestampMs: beforeTs}
+	}
+	pages, complete, exhausted, cursor, err := fetchOpenHistory(tid, cutoff, 500, before)
+	state := "partial"
+	switch {
+	case err != nil:
+		state = "error"
+		log.Warn().Err(err).Int64("thread", tid).Int("pages", pages).Msg("syncOpenHistory failed")
+	case exhausted:
+		state = "exhausted"
+	case complete:
+		state = "done"
+	case pages == 0:
+		state = "unavailable"
+	}
+	result["state"] = state
+	if !complete && !older && cursor != nil && cursor.MinMessageId != "" && cursor.MinTimestampMs > cutoff {
+		result["beforeId"] = cursor.MinMessageId
+		result["beforeTs"] = cursor.MinTimestampMs
+	}
+	emit(result)
+	fmt.Fprintf(os.Stderr, "History sync for %s: %s (%d pages)\n", thread, state, pages)
+}
+
+// fetchOpenHistory walks confirmed server ranges. It stops at the requested
+// timestamp or at the beginning of server history, whichever arrives first.
+func fetchOpenHistory(tid, cutoff int64, maxPages int, before *table.LSInsertNewMessageRange) (pages int, complete, exhausted bool, cursor *table.LSInsertNewMessageRange, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	for pages < maxPages && ctx.Err() == nil {
+		rangePage, err := requestOpenHistoryPage(ctx, tid, before)
+		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			return pages, false, false, before, err
+		}
+		if rangePage == nil {
+			break
+		}
+		moved := before == nil || rangeMovesBack(before, rangePage)
+		sameAnchor := before != nil && before.MinMessageId == rangePage.MinMessageId && before.MinTimestampMs == rangePage.MinTimestampMs
+		if (moved || sameAnchor) && !rangePage.HasMoreBefore {
+			return pages + 1, true, true, nil, nil
+		}
+		if !moved || rangePage.MinMessageId == "" || rangePage.MinTimestampMs <= 0 {
+			break
+		}
+		pages++
+		if cutoff > 0 && rangePage.MinTimestampMs <= cutoff {
+			return pages, true, false, nil, nil
+		}
+		before = rangePage
+	}
+	return pages, false, false, before, nil
+}
+
+func rangeMovesBack(previous, page *table.LSInsertNewMessageRange) bool {
+	return page.MinTimestampMs < previous.MinTimestampMs ||
+		(page.MinTimestampMs == previous.MinTimestampMs && page.MinMessageId != previous.MinMessageId)
+}
+
+func requestOpenHistoryPage(ctx context.Context, tid int64, before *table.LSInsertNewMessageRange) (*table.LSInsertNewMessageRange, error) {
+	sg := syncGroupFor(tid)
+	_, gen := getLastRange(tid)
+	refTs := time.Now().UnixMilli() + 60_000
+	var refID string
+	if before == nil {
+		if _, err := runTasks(ctx, &socket.CreateThreadTask{ThreadFBID: tid, SyncGroup: int(sg)}); err != nil {
+			return nil, err
+		}
+		waitForRangeUpdate(tid, gen, 2*time.Second)
+		if page, nextGen := getLastRange(tid); nextGen != gen {
+			return page, nil
+		}
+	} else {
+		refTs, refID = before.MinTimestampMs, before.MinMessageId
+	}
+	task := &socket.FetchMessagesTask{
+		ThreadKey:            tid,
+		Direction:            0,
+		ReferenceTimestampMs: refTs,
+		ReferenceMessageId:   refID,
+		SyncGroup:            sg,
+		Cursor:               client.GetCursor(cursorDBFor(sg)),
+	}
+	if _, err := runTasks(ctx, task); err != nil {
+		return nil, err
+	}
+	waitForRangeUpdate(tid, gen, 8*time.Second)
+	page, nextGen := getLastRange(tid)
+	if nextGen == gen {
+		return nil, nil
+	}
+	return page, nil
+}
+
+// Fetch the page containing the target without downloading the intervening history.
+func fetchQuotedMessage(thread, id string, ts int64) {
+	defer emit(map[string]any{"type": "quoteFetched", "thread": thread, "id": id})
+	tid := toInt64(thread)
+	if tid <= 0 || client == nil || id == "" || ts <= 0 {
+		return
+	}
+	mu := threadRefreshLock(thread)
+	mu.Lock()
+	defer mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	_, _ = requestOpenHistoryPage(ctx, tid, &table.LSInsertNewMessageRange{
+		MinMessageId:   id,
+		MinTimestampMs: ts + 1,
+	})
 }
 
 // loadEarlier backfills older messages before the oldest one the app currently has.
@@ -1964,6 +2119,9 @@ func loadEarlier(threadStr, oldestID string, oldestTs int64, fromMe bool) {
 			tid = openID
 		}
 	}
+	mu := threadRefreshLock(fmtID(tid))
+	mu.Lock()
+	defer mu.Unlock()
 	sg := syncGroupFor(tid)
 	cursorDB := cursorDBFor(sg)
 	refTs := oldestTs
@@ -2056,15 +2214,50 @@ func noteSticker(msgID string, id int64, url string, fromMessage bool) {
 	emit(map[string]any{"type": "stickerSeen", "stickerId": fmt.Sprint(stickerIDs[msgID]), "url": stickerURLs[msgID]})
 }
 
-func sendSticker(threadStr string, stickerID int64) {
+type sentSticker struct {
+	id      int64
+	picture string
+}
+
+var sentStickers sync.Map
+
+func attachSentSticker(otid, messageID, thread string) int64 {
+	if value, ok := sentStickers.Load(otid); ok && messageID != "" {
+		sticker := value.(sentSticker)
+		emitStickerPicture(messageID, thread, sticker.picture)
+		return sticker.id
+	}
+	return 0
+}
+
+func emitStickerPicture(messageID, thread, picture string) {
+	emit(map[string]any{"type": "media", "id": messageID, "thread": thread, "kind": "sticker", "url": picture})
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func sendSticker(threadStr string, stickerID int64, picture string) {
 	tid, err := strconv.ParseInt(threadStr, 10, 64)
 	if err != nil || client == nil {
 		emit(map[string]any{"type": "error", "msg": "stickers can only be sent in regular chats"})
 		return
 	}
+	otid := methods.GenerateEpochID()
+	key := fmtID(otid)
+	if strings.HasPrefix(picture, "https://") {
+		sentStickers.Store(key, sentSticker{stickerID, picture})
+		time.AfterFunc(2*time.Minute, func() { sentStickers.Delete(key) })
+	}
 	task := &socket.SendMessageTask{
 		ThreadId:         tid,
-		Otid:             methods.GenerateEpochID(),
+		Otid:             otid,
 		Source:           table.MESSENGER_INBOX_IN_THREAD,
 		InitiatingSource: table.FACEBOOK_INBOX,
 		SendType:         table.STICKER,
@@ -2072,6 +2265,7 @@ func sendSticker(threadStr string, stickerID int64) {
 		StickerId:        stickerID,
 	}
 	if _, err := runTasks(context.Background(), task); err != nil {
+		sentStickers.Delete(key)
 		log.Error().Err(err).Msg("send sticker failed")
 		emit(map[string]any{"type": "error", "msg": "sticker: " + err.Error()})
 	}
@@ -2092,6 +2286,80 @@ func noteOldestThread(key, ts, parent int64, folder string) {
 	defer oldestMu.Unlock()
 	if oldestTs == 0 || ts < oldestTs {
 		oldestKey, oldestTs = key, ts
+	}
+}
+
+var recentInboxWake = make(chan struct{}, 1)
+
+// Socket events remain the primary feed. Periodically refetch the head of both
+// inbox transports to catch missed events; on reconnect also cover today's rows.
+func watchRecentInbox() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		var pages int
+		select {
+		case <-recentInboxWake:
+			pages = 12
+		case <-ticker.C:
+			pages = 1
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		refreshRecentInbox(ctx, pages)
+		cancel()
+	}
+}
+
+func refreshRecentInbox(ctx context.Context, pages int) {
+	const newest int64 = 9_999_999_999_999
+	cutoff := time.Now().Add(-24 * time.Hour).UnixMilli()
+	type anchor struct{ key, activity int64 }
+	groups := []int{1, 95}
+	anchors := map[int]anchor{1: {activity: newest}, 95: {activity: newest}}
+	for page := 0; page < pages && len(anchors) > 0 && ctx.Err() == nil; page++ {
+		tasks := make([]socket.Task, 0, len(anchors))
+		for _, group := range groups {
+			a, ok := anchors[group]
+			if !ok {
+				continue
+			}
+			task := &socket.FetchThreadsTask{
+				ParentThreadKey:            -1,
+				ReferenceThreadKey:         a.key,
+				ReferenceActivityTimestamp: a.activity,
+				SyncGroup:                  group,
+			}
+			if group == 1 {
+				task.Cursor = client.GetCursor(1)
+			}
+			tasks = append(tasks, task)
+		}
+		tbl, err := runTasks(ctx, tasks...)
+		if err != nil || tbl == nil {
+			return
+		}
+		for _, group := range groups {
+			prev, ok := anchors[group]
+			if !ok {
+				continue
+			}
+			next := prev
+			for _, row := range tbl.LSUpsertSyncGroupThreadsRange {
+				if row.SyncGroup != int64(group) || row.ParentThreadKey > 0 || !row.HasMoreBefore {
+					continue
+				}
+				if row.MinThreadKey != 0 && row.MinLastActivityTimestampMS > cutoff &&
+					(row.MinLastActivityTimestampMS < next.activity ||
+						(row.MinLastActivityTimestampMS == next.activity && row.MinThreadKey < next.key)) {
+					next = anchor{row.MinThreadKey, row.MinLastActivityTimestampMS}
+				}
+			}
+			if next == prev {
+				delete(anchors, group)
+			} else {
+				anchors[group] = next
+			}
+		}
 	}
 }
 

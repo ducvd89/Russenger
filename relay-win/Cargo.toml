@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "russenger"
 version = "1.0.0"
 edition = "2021"
@@ -22,7 +22,7 @@ path = "src/bin/player.rs"
 name = "russenger-call"
 path = "src/bin/call.rs"
 
-[build-dependencies]
+[target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
 [dependencies]
@@ -39,11 +39,15 @@ tao = "0.32"
 ureq = "2"
 unicode-segmentation = "1"
 tray-icon = { version = "0.19", default-features = false }
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 webview2-com = "0.36"
 windows = "0.60"
 
-[dependencies.windows-sys]
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [
     "Win32_Foundation",

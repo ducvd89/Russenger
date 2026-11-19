@@ -12,8 +12,7 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess};
 
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let d = base.join("Relay");
+    let d = crate::paths::data_dir();
     let _ = std::fs::create_dir_all(&d);
     d
 }

@@ -31,7 +31,7 @@ impl Db {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
              CREATE TABLE IF NOT EXISTS messages(
                id TEXT PRIMARY KEY, thread TEXT NOT NULL, sender TEXT, text TEXT, ts REAL,
-               system INTEGER, reply_text TEXT, media_kind TEXT, media_ref TEXT);
+               system INTEGER, reply_text TEXT, media_kind TEXT, media_ref TEXT, reply_id TEXT, reply_ts REAL);
              CREATE INDEX IF NOT EXISTS msg_thread ON messages(thread, ts);
              CREATE TABLE IF NOT EXISTS threads(
                id TEXT PRIMARY KEY, name TEXT, snippet TEXT, picture TEXT, last_activity REAL,
@@ -50,6 +50,8 @@ impl Db {
         let _ = conn.execute("DELETE FROM media WHERE ref LIKE '%media-cache%'", []);
         // columns added later (errors = column already there)
         for sql in [
+            "ALTER TABLE messages ADD COLUMN reply_id TEXT",
+            "ALTER TABLE messages ADD COLUMN reply_ts REAL",
             "ALTER TABLE threads ADD COLUMN ttype INTEGER",
             "ALTER TABLE threads ADD COLUMN parent TEXT",
             "ALTER TABLE threads ADD COLUMN folder TEXT",
@@ -77,6 +79,10 @@ impl Db {
         let _ = self.conn.execute("INSERT OR REPLACE INTO stickers(id,url,seen) VALUES(?1,?2,?3)", params![id, url, seen]);
     }
     /// Stickers seen in chats, newest first: (sticker id, picture address).
+    pub fn sticker_url(&self, id: &str) -> Option<String> {
+        self.conn.query_row("SELECT url FROM stickers WHERE id=?1", [id], |row| row.get(0)).ok()
+    }
+
     pub fn load_stickers(&self, limit: usize) -> Vec<(String, String)> {
         let mut out = Vec::new();
         if let Ok(mut st) = self.conn.prepare("SELECT id,url FROM stickers ORDER BY seen DESC LIMIT ?1") {
@@ -96,16 +102,18 @@ impl Db {
 
     pub fn save_message(&self, thread: &str, m: &Message) {
         let _ = self.conn.execute(
-            "INSERT INTO messages(id,thread,sender,text,ts,system,reply_text,media_kind,media_ref)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            "INSERT INTO messages(id,thread,sender,text,ts,system,reply_text,media_kind,media_ref,reply_id,reply_ts)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULLIF(?11,0))
              ON CONFLICT(id) DO UPDATE SET
                thread=excluded.thread,
                text=CASE WHEN excluded.text != '' THEN excluded.text ELSE text END,
                ts=excluded.ts,
                reply_text=COALESCE(excluded.reply_text, reply_text),
+               reply_id=COALESCE(excluded.reply_id, reply_id),
+               reply_ts=COALESCE(excluded.reply_ts, reply_ts),
                media_kind=COALESCE(excluded.media_kind, media_kind),
                media_ref=COALESCE(excluded.media_ref, media_ref)",
-            params![m.id, thread, m.sender, m.text, m.ts, m.system, m.reply_text, m.media_kind, m.media_ref],
+            params![m.id, thread, m.sender, m.text, m.ts, m.system, m.reply_text, m.media_kind, m.media_ref, m.reply_id, m.reply_ts],
         );
     }
     pub fn latest_incoming(&self, thread: &str, self_id: &str) -> Option<(String, String)> {
@@ -362,66 +370,62 @@ impl Db {
         out
     }
 
-    /// Latest `limit` messages of a thread, oldest first.
     pub fn load_messages(&self, thread: &str, limit: usize) -> Vec<Message> {
+        self.load_messages_in_range(thread, 0.0, f64::MAX, limit)
+    }
+
+    /// Uses `<=` so messages sharing the boundary timestamp are never skipped.
+    pub fn load_messages_before(&self, thread: &str, before: f64, limit: usize) -> Vec<Message> {
+        self.load_messages_in_range(thread, 0.0, before, limit + 16)
+    }
+
+    pub fn load_messages_in_range(&self, thread: &str, after: f64, before: f64, limit: usize) -> Vec<Message> {
         let mut st = match self.conn.prepare(
-            "SELECT id,sender,text,ts,system,reply_text,media_kind,media_ref FROM messages
-             WHERE thread=?1 ORDER BY ts DESC, id DESC LIMIT ?2",
+            "SELECT id,sender,text,ts,system,reply_text,media_kind,media_ref,reply_id,reply_ts FROM messages
+             WHERE thread=?1 AND ts>=?2 AND ts<=?3 ORDER BY ts DESC, id DESC LIMIT ?4",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
         let mut v: Vec<Message> = st
-            .query_map(params![thread, limit as i64], |r| {
-                Ok(Message {
-                    id: r.get(0)?,
-                    sender: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    text: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    ts: r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                    system: r.get::<_, Option<bool>>(4)?.unwrap_or(false),
-                    reply_text: r.get(5)?,
-                    media_kind: r.get(6)?,
-                    media_ref: r.get(7)?,
-                    reactions: Vec::new(),
-                    pending: false,
-                    link: None,
-                })
-            })
+            .query_map(params![thread, after, before, limit as i64], Self::decode_message)
             .map(|it| it.filter_map(Result::ok).collect())
             .unwrap_or_default();
         v.reverse();
         v
     }
 
-    /// The `limit` messages of a thread at or older than `before`, oldest first.
-    /// Uses `<=` so messages sharing the boundary timestamp are never skipped (caller deduplicates by id).
-    pub fn load_messages_before(&self, thread: &str, before: f64, limit: usize) -> Vec<Message> {
-        let mut st = match self.conn.prepare(
-            "SELECT id,sender,text,ts,system,reply_text,media_kind,media_ref FROM messages
-             WHERE thread=?1 AND ts<=?3 ORDER BY ts DESC, id DESC LIMIT ?2",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        let mut v: Vec<Message> = st
-            .query_map(params![thread, (limit + 16) as i64, before], |r| {
-                Ok(Message {
-                    id: r.get(0)?,
-                    sender: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    text: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    ts: r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                    system: r.get::<_, Option<bool>>(4)?.unwrap_or(false),
-                    reply_text: r.get(5)?,
-                    media_kind: r.get(6)?,
-                    media_ref: r.get(7)?,
-                    reactions: Vec::new(),
-                    pending: false,
-                    link: None,
-                })
-            })
-            .map(|it| it.filter_map(Result::ok).collect())
-            .unwrap_or_default();
-        v.reverse();
-        v
+    fn decode_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+        Ok(Message {
+            id: row.get(0)?,
+            sender: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            text: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ts: row.get::<_, Option<f64>>(3)?.unwrap_or_default(),
+            system: row.get::<_, Option<bool>>(4)?.unwrap_or_default(),
+            reply_text: row.get(5)?,
+            media_kind: row.get(6)?,
+            media_ref: row.get(7)?,
+            reply_id: row.get(8)?,
+            reply_ts: row.get::<_, Option<f64>>(9)?.unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
+    pub fn load_message(&self, thread: &str, id: &str) -> Option<Message> {
+        self.conn.query_row(
+            "SELECT id,sender,text,ts,system,reply_text,media_kind,media_ref,reply_id,reply_ts FROM messages WHERE thread=?1 AND id=?2",
+            params![thread, id],
+            Self::decode_message,
+        ).ok()
+    }
+
+    /// Old cache rows stored only the quote text. Resolve it only when there is one exact match.
+    pub fn unique_quoted_id(&self, thread: &str, reply: &Message, quote: &str) -> Option<String> {
+        let mut st = self.conn.prepare(
+            "SELECT id FROM messages WHERE thread=?1 AND text=?2 AND ts<=?3 AND id!=?4 LIMIT 2",
+        ).ok()?;
+        let mut matches = st.query_map(params![thread, quote, reply.ts, reply.id], |r| r.get(0)).ok()?;
+        let id = matches.next()?.ok()?;
+        if matches.next().is_some() { None } else { Some(id) }
     }
 }

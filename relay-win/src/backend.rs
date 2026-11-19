@@ -14,16 +14,16 @@ pub struct Backend {
 }
 
 fn helper_path() -> PathBuf {
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    let name = crate::paths::executable_name("relay-helper");
     [
-        exe_dir.map(|d| d.join("relay-helper.exe")),
-        Some(PathBuf::from("../bin/relay-helper.exe")),
-        Some(PathBuf::from("bin/relay-helper.exe")),
+        crate::paths::sibling_executable("relay-helper"),
+        Some(PathBuf::from("../bin").join(&name)),
+        Some(PathBuf::from("bin").join(&name)),
     ]
     .into_iter()
     .flatten()
     .find(|p| p.exists())
-    .unwrap_or_else(|| PathBuf::from("relay-helper.exe"))
+    .unwrap_or_else(|| PathBuf::from(name))
 }
 
 impl Backend {
@@ -37,6 +37,8 @@ impl Backend {
         if std::env::var_os("RELAY_PLATFORM").is_none() {
             cmd.env("RELAY_PLATFORM", "facebook");
         }
+        #[cfg(target_os = "macos")]
+        cmd.env("RELAY_DATA_DIR", crate::vault::data_dir());
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(log));
         #[cfg(windows)]
         {

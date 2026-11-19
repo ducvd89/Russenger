@@ -1,11 +1,12 @@
 use crate::backend::Backend;
 use crate::db::Db;
-use crate::model::{is_placeholder, Message, Store, Thread};
+use crate::icons::{self, Icon};
+use crate::model::{is_placeholder, Message, Store, Thread, DAY_MS};
 use crate::theme::{self, Palette};
 use crate::{cache, notify, vault};
 use chrono::{Datelike, TimeZone};
 use eframe::egui::{
-    self, text::LayoutJob, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, RichText, Sense, TextFormat, Vec2,
+    self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, RichText, Sense, Vec2,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -35,6 +36,10 @@ enum Action {
     Mute { thread: String, muted: bool },
     DeleteThread(String),
     LoadEarlier,
+    SyncOpenHistory(String),
+    ResolveReactionActor(String),
+    ResolveThreadAvatar(String),
+    JumpToQuote { thread: String, reply: String },
     OpenUrl(String),
     SaveFile(String),
     Settings,
@@ -80,6 +85,7 @@ fn tab_of(t: &Thread) -> Option<Tab> {
 
 /// What a click on a spot inside a bubble does (the bubble itself also senses clicks).
 enum Hit {
+    Quote,
     Url(String),
     Image(String),
     Play(String),
@@ -115,9 +121,23 @@ pub struct App {
     pick_tx: Sender<(String, PathBuf)>,
     pick_rx: Receiver<(String, PathBuf)>,
     requested: HashSet<String>,
+    resolved_avatars: std::collections::HashMap<String, (String, String)>,
+    avatar_attempts: std::collections::HashMap<String, Instant>,
     focus_input: bool,
     pin: String,
     history_asked: bool,
+    open_history_sync: std::collections::HashMap<String, String>,
+    older_loading: HashSet<String>,
+    top_scrolls: u8,
+    last_top_scroll: Option<Instant>,
+    was_at_chat_top: bool,
+    next_inbox_history_check: Instant,
+    inbox_history_attempts: std::collections::HashMap<String, (f64, Instant)>,
+    // The original top row and the last observed first row while history is being prepended.
+    history_anchor: Option<(String, String, String)>,
+    scroll_to_message: Option<(String, Align)>,
+    quote_highlight: Option<(String, Instant)>,
+    pending_quote: Option<(String, Message)>,
     more_threads_asked: bool,
     backend_started: Instant,
     dark: bool,
@@ -153,8 +173,10 @@ pub struct App {
     search_for: String,
     /// files waiting for "send?" confirmation: (path, temporary copy to delete afterwards)
     outgoing: Vec<(PathBuf, bool)>,
+    #[cfg(windows)]
     paste_down: bool,
     tray: Option<tray_icon::TrayIcon>,
+    #[cfg(windows)]
     hwnd: Option<isize>,
     /// closing the window keeps the program running in the tray
     tray_on: bool,
@@ -288,19 +310,53 @@ fn fit_text(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> String {
     chars[..lo].iter().collect::<String>() + "…"
 }
 
-fn avatar(ui: &mut egui::Ui, url: Option<&str>, name: &str, key: &str, size: f32) {
-    let r = CornerRadius::same((size / 2.0) as u8);
-    match url {
-        Some(u) if !u.is_empty() => {
-            ui.add(egui::Image::new(crate::cache::image_uri(u)).fit_to_exact_size(Vec2::splat(size)).corner_radius(r));
+/// Draw the first usable image, or a stable initials badge while pictures load.
+fn avatar<'a>(
+    ui: &mut egui::Ui,
+    sources: impl IntoIterator<Item = &'a str>,
+    name: &str,
+    key: &str,
+    size: f32,
+) -> bool {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let mut pending = false;
+    for source in sources.into_iter().filter(|source| !source.is_empty()) {
+        let uri = crate::cache::image_uri(source);
+        let mut texture = ctx_texture(ui, &uri, size);
+        if texture.is_err() && uri != source && (source.starts_with("https://") || source.starts_with("http://")) {
+            texture = ctx_texture(ui, source, size);
         }
-        _ => {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-            ui.painter().circle_filled(rect.center(), size / 2.0, theme::avatar_color(key));
-            let ch = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, ch, theme::semibold(size * 0.42), Color32::WHITE);
+        match texture {
+            Ok(egui::load::TexturePoll::Ready { texture }) => {
+                egui::Image::from_texture(texture).corner_radius(CornerRadius::same((size / 2.0) as u8)).paint_at(ui, rect);
+                return true;
+            }
+            Ok(egui::load::TexturePoll::Pending { .. }) => pending = true,
+            Err(_) => {}
         }
     }
+    ui.painter().circle_filled(rect.center(), size / 2.0, theme::avatar_color(key));
+    let ch = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, ch, theme::semibold(size * 0.42), Color32::WHITE);
+    pending
+}
+
+fn ctx_texture(ui: &egui::Ui, uri: &str, size: f32) -> egui::load::TextureLoadResult {
+    ui.ctx().try_load_texture(uri, egui::TextureOptions::LINEAR, Vec2::splat(size).into())
+}
+
+fn paint_message_time(
+    ui: &egui::Ui,
+    pos: egui::Pos2,
+    galley: std::sync::Arc<egui::Galley>,
+    color: Color32,
+    status: Option<Icon>,
+) {
+    if let Some(icon) = status {
+        let center = pos + Vec2::new(galley.size().x + 9.0, galley.size().y * 0.5);
+        icons::paint(ui.painter(), icon, egui::Rect::from_center_size(center, Vec2::splat(12.0)), color);
+    }
+    ui.painter().galley(pos, galley, color);
 }
 
 /// `russenger --demo`: fake data for checking the layout (no backend, no database).
@@ -369,7 +425,8 @@ fn demo_store() -> Store {
         m("a7", "me", "Bong bóng gộp theo người gửi, có chip ngày ở trên", 19.0 * min),
         m("a8", "100", "Ok, mai gặp nhé 👍", 2.0 * min),
     ];
-    a[7].reply_text = Some("Giao diện giờ trông giống Telegram luôn đó".into());
+    a[7].reply_text = Some(a[4].text.clone());
+    a[7].reply_id = Some(a[4].id.clone());
     // a shared-link card
     let mut card = m("a12", "100", "https://www.example.com/bai-viet", 120_000.0);
     card.link = Some(crate::model::LinkPreview {
@@ -387,7 +444,7 @@ fn demo_store() -> Store {
     img_url.media_ref = Some("https://www.gstatic.com/webp/gallery/1.jpg".into());
     let mut img_file = m("a10", "me", "", 60_000.0);
     img_file.media_kind = Some("image".into());
-    img_file.media_ref = Some(format!("{}\\Relay\\icon.png", std::env::var("LOCALAPPDATA").unwrap_or_default()));
+    img_file.media_ref = Some(vault::data_dir().join("icon.png").to_string_lossy().into_owned());
     let mut img_file2 = m("a11", "100", "", 30_000.0);
     img_file2.media_kind = Some("image".into());
     img_file2.media_ref = img_file.media_ref.clone();
@@ -597,9 +654,22 @@ impl App {
             pick_tx,
             pick_rx,
             requested: HashSet::new(),
+            resolved_avatars: Default::default(),
+            avatar_attempts: Default::default(),
             focus_input: false,
             pin: String::new(),
             history_asked: false,
+            open_history_sync: Default::default(),
+            older_loading: Default::default(),
+            top_scrolls: 0,
+            last_top_scroll: None,
+            was_at_chat_top: false,
+            next_inbox_history_check: Instant::now(),
+            inbox_history_attempts: Default::default(),
+            history_anchor: None,
+            scroll_to_message: None,
+            quote_highlight: None,
+            pending_quote: None,
             more_threads_asked: false,
             backend_started: Instant::now(),
             dark,
@@ -625,8 +695,10 @@ impl App {
             search_hits: Vec::new(),
             search_for: String::new(),
             outgoing: Vec::new(),
+            #[cfg(windows)]
             paste_down: false,
             tray: None,
+            #[cfg(windows)]
             hwnd: None,
             tray_on: db_tray,
             sidebar_w,
@@ -652,6 +724,7 @@ impl App {
         if !demo {
             notify::watch_open_requests(cc.egui_ctx.clone());
         }
+        #[cfg(windows)]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             app.hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
@@ -664,6 +737,10 @@ impl App {
             if let (Some(h), false) = (app.hwnd, demo) {
                 app.tray = crate::tray::create(h);
             }
+        }
+        #[cfg(target_os = "macos")]
+        if !demo {
+            app.tray = crate::tray::create(cc.egui_ctx.clone());
         }
         if demo {
             app.screen = Screen::Main;
@@ -691,6 +768,10 @@ impl App {
         self.store.last_error = None;
         self.reconnect_at = None;
         self.history_asked = false;
+        self.open_history_sync.clear();
+        self.older_loading.clear();
+        self.inbox_history_attempts.clear();
+        self.history_anchor = None;
         self.more_threads_asked = false;
         self.backend_started = Instant::now();
         self.store.history_state.clear();
@@ -701,7 +782,7 @@ impl App {
                 b.login(&cookies);
                 self.backend = Some(b);
             }
-            Err(e) => self.store.last_error = Some(format!("Không chạy được relay-helper.exe: {e}")),
+            Err(e) => self.store.last_error = Some(format!("Không chạy được relay-helper: {e}")),
         }
     }
 
@@ -731,9 +812,9 @@ impl App {
     }
 
     fn spawn_login_window(&mut self) {
-        let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("russenger-login.exe")));
+        let exe = crate::paths::sibling_executable("russenger-login");
         let Some(exe) = exe.filter(|p| p.exists()) else {
-            self.login_status = "Không tìm thấy russenger-login.exe cạnh ứng dụng.".into();
+            self.login_status = "Không tìm thấy russenger-login cạnh ứng dụng.".into();
             return;
         };
         let (tx, rx) = channel();
@@ -778,6 +859,11 @@ impl App {
         for f in ["relay.db", "relay.db-wal", "relay.db-shm", "history-device.json"] {
             let _ = std::fs::remove_file(d.join(f));
         }
+        #[cfg(target_os = "macos")]
+        for f in ["wadevice.db", "wadevice.db-wal", "wadevice.db-shm"] {
+            let _ = std::fs::remove_file(d.join(f));
+        }
+        #[cfg(windows)]
         if let Some(a) = std::env::var_os("APPDATA") {
             let r = PathBuf::from(a).join("Relay");
             for f in ["wadevice.db", "wadevice.db-wal", "wadevice.db-shm"] {
@@ -786,6 +872,8 @@ impl App {
         }
         cache::clear();
         self.store = Store::with_db(Db::open().ok());
+        self.resolved_avatars.clear();
+        self.avatar_attempts.clear();
         self.selected = None;
     }
 
@@ -817,7 +905,50 @@ impl App {
                 db.begin();
             }
             for ev in &evs {
-                self.store.apply(ev);
+                if ev["type"] == "avatarResolved" {
+                    if let (Some(thread), Some(source), Some(image)) =
+                        (ev["thread"].as_str(), ev["source"].as_str(), ev["image"].as_str())
+                    {
+                        self.resolved_avatars.insert(thread.to_owned(), (source.to_owned(), image.to_owned()));
+                    }
+                } else if ev["type"] == "quoteFetched" {
+                    let matches = self.pending_quote.as_ref().is_some_and(|(thread, reply)| {
+                        ev["thread"].as_str() == Some(thread.as_str()) && ev["id"].as_str() == reply.reply_id.as_deref()
+                    });
+                    if matches {
+                        if let Some((thread, reply)) = self.pending_quote.take() {
+                            if !self.jump_to_quote(&thread, &reply) {
+                                self.store.last_error = Some("Tin nhắn gốc chưa có trong lịch sử đã tải.".into());
+                            }
+                        }
+                    }
+                } else if ev["type"] == "openHistorySync" {
+                    if let (Some(thread), Some(state)) = (ev["thread"].as_str(), ev["state"].as_str()) {
+                        if ev["older"].as_bool().unwrap_or(false) {
+                            self.older_loading.remove(thread);
+                            if state == "exhausted" {
+                                self.store.history_done.insert(thread.to_owned());
+                            }
+                            continue;
+                        }
+                        self.open_history_sync.insert(thread.to_owned(), state.to_owned());
+                        if let Some(db) = &self.store.db {
+                            let key = format!("open_history_cursor/{thread}");
+                            let cursor = match (ev["beforeId"].as_str(), ev["beforeTs"].as_i64()) {
+                                (Some(id), Some(ts)) => json!({"beforeId": id, "beforeTs": ts}).to_string(),
+                                _ => String::new(),
+                            };
+                            db.set_setting(&key, &cursor);
+                        }
+                    }
+                } else {
+                    if ev["type"] == "historyPage" {
+                        if let Some(thread) = ev["thread"].as_str() {
+                            self.older_loading.remove(thread);
+                        }
+                    }
+                    self.store.apply(ev);
+                }
             }
             if let Some(db) = &self.store.db {
                 db.commit();
@@ -879,6 +1010,12 @@ impl App {
         }
     }
 
+    fn open_history_cursor(&self, thread: &str) -> Option<serde_json::Value> {
+        let saved = self.store.db.as_ref()?.get_setting(&format!("open_history_cursor/{thread}"))?;
+        let cursor: serde_json::Value = serde_json::from_str(&saved).ok()?;
+        (cursor["beforeTs"].as_f64()? > now_ms() as f64 - 7.0 * DAY_MS).then_some(cursor)
+    }
+
     fn request_refresh(&mut self, thread: &str) {
         let since_ts = if self.store.ready {
             self.store.pre_sync_max_ts.remove(thread)
@@ -888,6 +1025,44 @@ impl App {
         .unwrap_or(0.0);
         if let Some(b) = &mut self.backend {
             b.refresh_thread(thread, since_ts as i64);
+        }
+    }
+
+    fn check_encrypted_inbox_history(&mut self) {
+        let now = Instant::now();
+        if !self.store.ready || self.store.history_state != "restored" || self.backend.is_none() {
+            return;
+        }
+        if now < self.next_inbox_history_check {
+            self.ctx.request_repaint_after(self.next_inbox_history_check - now);
+            return;
+        }
+        self.next_inbox_history_check = now + Duration::from_secs(20);
+        self.ctx.request_repaint_after(Duration::from_secs(20));
+        let Some(db) = &self.store.db else { return };
+        let cached = db.max_message_ts_by_thread();
+        let cutoff = now_ms() as f64 - 7.0 * DAY_MS;
+        let mut behind: Vec<_> = self.store.threads.values().filter_map(|thread| {
+            if !thread.id.starts_with("e:") || thread.last_activity < cutoff || tab_of(thread) != Some(Tab::Chats) {
+                return None;
+            }
+            let since = cached.get(&thread.id).copied().unwrap_or(0.0);
+            if since + 999.0 >= thread.last_activity {
+                return None;
+            }
+            if self.inbox_history_attempts.get(&thread.id).is_some_and(|&(activity, last)| {
+                activity == thread.last_activity && now.duration_since(last) < Duration::from_secs(120)
+            }) {
+                return None;
+            }
+            Some((thread.id.clone(), thread.last_activity, since.max(cutoff)))
+        }).collect();
+        behind.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, activity, since) in behind.into_iter().take(2) {
+            self.inbox_history_attempts.insert(id.clone(), (activity, now));
+            if let Some(backend) = &mut self.backend {
+                backend.refresh_thread(&id, since as i64);
+            }
         }
     }
 
@@ -987,13 +1162,56 @@ impl App {
             if encrypted {
                 (self.store.history_state == "restored").then(|| json!({"cmd": "loadEncryptedHistory", "thread": th, "before": list[i].ts as i64 + 1}))
             } else {
-                // history is fetched "older than" a reference, so anchor on the next newer message
-                list.get(i + 1).map(|n| json!({"cmd": "loadEarlier", "thread": th, "oldestId": n.id, "oldestTs": n.ts, "fromMe": n.sender == self.store.self_id}))
+                let message = &list[i];
+                let id = message.id.split('#').next().unwrap_or(&message.id);
+                Some(json!({"cmd": "loadEarlier", "thread": th, "oldestId": id, "oldestTs": message.ts as i64 + 1, "fromMe": message.sender == self.store.self_id}))
             }
         });
         self.repaired.insert(th.to_string());
         if let Some(c) = cmd {
             self.send_cmd(c);
+        }
+    }
+
+    fn jump_to_quote(&mut self, thread: &str, reply: &Message) -> bool {
+        let Some(original) = self.store.reveal_quoted_message(thread, reply) else { return false };
+        self.history_anchor = None;
+        self.scroll_bottom = false;
+        self.stuck_bottom.insert(thread.to_owned(), false);
+        self.scroll_to_message = Some((original.clone(), Align::Center));
+        self.quote_highlight = Some((original, Instant::now() + Duration::from_secs(2)));
+        self.ctx.request_repaint();
+        self.ctx.request_repaint_after(Duration::from_secs(2));
+        true
+    }
+
+    fn load_earlier(&mut self, thread: &str) {
+        if self.older_loading.contains(thread) || self.store.history_done.contains(thread) {
+            return;
+        }
+        self.top_scrolls = 0;
+        self.last_top_scroll = None;
+        let oldest = self.store.messages.get(thread)
+            .and_then(|list| list.iter().find(|message| !message.pending)).cloned();
+        let ts = oldest.as_ref().map_or(0.0, |message| message.ts);
+        if let Some(message) = &oldest {
+            self.history_anchor = Some((thread.to_owned(), message.id.clone(), message.id.clone()));
+            self.store.load_cached_history(thread, (ts - 3.0 * DAY_MS).max(0.0), ts);
+        }
+        if !self.store.ready || self.backend.is_none() {
+            return;
+        }
+        let before_id = oldest.as_ref().map(|message| message.id.split('#').next().unwrap_or(&message.id)).unwrap_or("");
+        if !thread.starts_with("e:") {
+            self.older_loading.insert(thread.to_owned());
+            self.send_cmd(json!({"cmd": "syncOpenHistory", "thread": thread, "older": true, "beforeId": before_id, "beforeTs": ts as i64}));
+        } else if self.store.history_state == "restored" {
+            self.older_loading.insert(thread.to_owned());
+            let before = if ts > 0.0 { ts as i64 + 999 } else { 0 };
+            self.send_cmd(json!({"cmd": "loadEncryptedHistory", "thread": thread, "before": before, "window": true}));
+        } else {
+            let from_me = oldest.as_ref().is_some_and(|message| message.sender == self.store.self_id);
+            self.send_cmd(json!({"cmd": "loadEarlier", "thread": thread, "oldestId": before_id, "oldestTs": ts as i64, "fromMe": from_me}));
         }
     }
 
@@ -1080,6 +1298,14 @@ impl App {
                 }
                 self.store.ensure_loaded(&id);
                 self.seen_len = self.store.messages.get(&id).map(|l| l.len()).unwrap_or(0);
+                if self.selected.as_deref() != Some(&id) {
+                    self.top_scrolls = 0;
+                    self.last_top_scroll = None;
+                    self.was_at_chat_top = false;
+                    self.history_anchor = None;
+                    self.scroll_to_message = None;
+                    self.pending_quote = None;
+                }
                 self.selected = Some(id.clone());
                 self.reply = None;
                 self.editing = None;
@@ -1149,33 +1375,57 @@ impl App {
                     self.selected = None;
                 }
             }
-            Action::LoadEarlier => {
-                if let Some(th) = self.selected.clone() {
-                    // stored history first; the server is asked only when that is used up
-                    if self.store.load_older_from_db(&th) > 0 {
-                        return;
-                    }
-                    let oldest = self.store.messages.get(&th).and_then(|l| l.iter().find(|m| !m.pending).cloned());
-                    if let Some(m) = oldest {
-                        let base_id = m.id.split('#').next().unwrap_or(&m.id).to_string();
-                        let from_me = m.sender == self.store.self_id;
-                        if th.starts_with("e:") && self.store.history_state == "restored" {
-                            // encrypted archive: pages are keyed by timestamp (+999ms avoids skipping same-second WA msgs)
-                            self.store.history_busy = true;
-                            self.send_cmd(json!({"cmd": "loadEncryptedHistory", "thread": th, "before": m.ts as i64 + 999}));
-                        } else {
-                            self.send_cmd(json!({"cmd": "loadEarlier", "thread": th, "oldestId": base_id, "oldestTs": m.ts as i64, "fromMe": from_me}));
-                        }
-                    } else if th.starts_with("e:") && self.store.history_state == "restored" {
-                        self.store.history_busy = true;
-                        self.send_cmd(json!({"cmd": "loadEncryptedHistory", "thread": th, "before": 0}));
+            Action::ResolveThreadAvatar(thread) => {
+                if !self.store.ready || self.backend.is_none() || self.avatar_attempts.get(&thread)
+                    .is_some_and(|when| when.elapsed() < Duration::from_secs(300))
+                {
+                    return;
+                }
+                if let Some(chat) = self.store.threads.get(&thread) {
+                    let contact = chat.contact.as_deref().or_else(|| matches!(chat.ttype, 1 | 7 | 13 | 15)
+                        .then(|| thread.trim_start_matches("e:")));
+                    let request = json!({"cmd":"resolveThreadAvatar", "thread":thread, "picture":chat.picture, "contact":contact.unwrap_or("")});
+                    self.avatar_attempts.insert(thread, Instant::now());
+                    self.send_cmd(request);
+                }
+            }
+            Action::ResolveReactionActor(actor) => {
+                if self.store.ready && self.backend.is_some() && actor.parse::<i64>().is_ok() && self.requested.insert(actor.clone()) {
+                    self.send_cmd(json!({"cmd": "fetchContact", "id": actor}));
+                }
+            }
+            Action::SyncOpenHistory(thread) => {
+                if self.store.ready && self.backend.is_some() && !thread.starts_with("e:") {
+                    self.open_history_sync.insert(thread.clone(), "running".into());
+                    let mut request = self.open_history_cursor(&thread).unwrap_or_else(|| json!({}));
+                    request["cmd"] = json!("syncOpenHistory");
+                    request["thread"] = json!(thread);
+                    self.send_cmd(request);
+                }
+            }
+            Action::JumpToQuote { thread, reply } => {
+                let Some(message) = self.store.messages.get(&thread)
+                    .and_then(|list| list.iter().find(|message| message.id == reply).cloned()) else { return };
+                self.pending_quote = None;
+                if !self.jump_to_quote(&thread, &message) {
+                    if let Some(id) = message.reply_id.as_deref().filter(|_| {
+                        !thread.starts_with("e:") && message.reply_ts > 0.0 && self.store.ready && self.backend.is_some()
+                    }) {
+                        self.send_cmd(json!({"cmd": "fetchQuote", "thread": thread, "id": id, "ts": message.reply_ts as i64}));
+                        self.pending_quote = Some((thread, message));
                     } else {
-                        self.request_refresh(&th);
+                        self.store.last_error = Some("Tin nhắn gốc chưa có trong lịch sử đã tải.".into());
                     }
                 }
             }
+            Action::LoadEarlier => {
+                if let Some(thread) = self.selected.clone() {
+                    self.load_earlier(&thread);
+                }
+            }
             Action::SendSticker { thread, id } => {
-                self.send_cmd(json!({"cmd": "sendSticker", "thread": thread, "stickerId": id}));
+                let picture = self.store.stickers.iter().find(|(key, _)| key == &id).map(|(_, url)| url.as_str());
+                self.send_cmd(json!({"cmd": "sendSticker", "thread": thread, "stickerId": id, "picture": picture}));
                 self.scroll_bottom = true;
             }
             Action::MoreThreads => self.ask_more_threads(),
@@ -1200,7 +1450,7 @@ impl App {
                 let url = format!("https://www.facebook.com/messages/t/{id}");
                 let ok = self.cookies.as_deref().map(|c| notify::call(&url, video, c)).unwrap_or(false);
                 if !ok {
-                    self.store.last_error = Some("Không mở được cửa sổ gọi (thiếu russenger-call.exe hoặc chưa đăng nhập).".into());
+                    self.store.last_error = Some("Không mở được cửa sổ gọi (chưa đăng nhập hoặc không mở được trình duyệt).".into());
                 }
             }
             Action::ViewImage { thread, id } => {
@@ -1235,7 +1485,10 @@ impl App {
                     db.set_setting("theme", if self.dark { "dark" } else { "light" });
                 }
             }
-            Action::ScrollBottom => self.scroll_bottom = true,
+            Action::ScrollBottom => {
+                self.history_anchor = None;
+                self.scroll_bottom = true;
+            }
         }
     }
 
@@ -1331,7 +1584,7 @@ impl App {
                 }
             });
             ui.separator();
-            if ui.checkbox(&mut self.autostart, "Khởi động cùng Windows (chạy ẩn ở khay hệ thống)").changed() {
+            if ui.checkbox(&mut self.autostart, if cfg!(windows) { "Khởi động cùng Windows (chạy ẩn ở khay hệ thống)" } else { "Mở khi đăng nhập macOS" }).changed() {
                 notify::set_autostart(self.autostart);
             }
             if ui.checkbox(&mut self.tray_on, "Đóng cửa sổ thì chạy nền ở khay hệ thống").changed() {
@@ -1363,7 +1616,7 @@ impl App {
                         ui.add(egui::Image::from_bytes("bytes://russenger-icon.png", include_bytes!("../../assets/icon-512.png").as_slice()).fit_to_exact_size(Vec2::splat(84.0)));
                         ui.add_space(10.0);
                         ui.label(RichText::new("Russenger").font(theme::semibold(26.0)).color(p.text));
-                        ui.label(RichText::new("Messenger gốc, chạy native trên Windows").color(p.secondary).size(13.0));
+                        ui.label(RichText::new(if cfg!(windows) { "Messenger gốc, chạy native trên Windows" } else { "Messenger cho macOS" }).color(p.secondary).size(13.0));
                         ui.add_space(18.0);
                         let waiting = self.login_rx.is_some();
                         let btn = egui::Button::new(RichText::new("Đăng nhập bằng Facebook").font(theme::semibold(15.0)).color(Color32::WHITE))
@@ -1441,18 +1694,19 @@ impl App {
             ui.add_space(8.0);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                let core: [(Tab, &str, &str); 4] = [
-                    (Tab::Chats, "💬", "Chat"),
-                    (Tab::Marketplace, "🛍", "Chợ"),
-                    (Tab::Requests, "✉", "Chờ"),
-                    (Tab::Archive, "🗃", "Lưu trữ"),
+                let core = [
+                    (Tab::Chats, Icon::Chat, "Chat"),
+                    (Tab::Marketplace, Icon::Bag, "Chợ"),
+                    (Tab::Requests, Icon::Mail, "Chờ"),
+                    (Tab::Archive, Icon::Archive, "Lưu trữ"),
                 ];
-                for (tab, glyph, label) in core {
+                for (tab, icon, label) in core {
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), Sense::click());
                     let selected = self.tab == tab;
                     rail_item_bg(ui, rect, &resp, selected, p);
                     let col = if selected { p.accent } else { p.secondary };
-                    ui.painter().text(egui::pos2(rect.center().x, rect.top() + 23.0), Align2::CENTER_CENTER, glyph, theme::body(22.0), col);
+                    let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 23.0), Vec2::splat(22.0));
+                    icons::paint(ui.painter(), icon, icon_rect, col);
                     ui.painter().text(egui::pos2(rect.center().x, rect.top() + 45.0), Align2::CENTER_CENTER, label, if selected { theme::semibold(11.0) } else { theme::body(11.0) }, col);
                     rail_badge(ui, rect, unread.get(&tab).copied().unwrap_or(0), p);
                     if resp.clicked() {
@@ -1488,6 +1742,20 @@ impl App {
         }
     }
 
+    fn draw_thread_avatar(&self, ui: &mut egui::Ui, chat: &Thread, name: &str, size: f32, actions: &mut Vec<Action>) {
+        let resolved = self.resolved_avatars.get(&chat.id)
+            .filter(|(source, image)| source == &chat.picture && crate::cache::exists(image))
+            .map(|(_, image)| image.as_str());
+        let picture = (chat.picture.starts_with("https://") || chat.picture.starts_with("http://")).then_some(chat.picture.as_str());
+        let contact = self.store.thread_contact_avatar(chat);
+        if !avatar(ui, [resolved, picture, contact].into_iter().flatten(), name, &chat.id, size)
+            && self.store.ready && self.backend.is_some()
+            && self.avatar_attempts.get(&chat.id).is_none_or(|when| when.elapsed() >= Duration::from_secs(300))
+        {
+            actions.push(Action::ResolveThreadAvatar(chat.id.clone()));
+        }
+    }
+
     fn draw_thread_list(&mut self, ctx: &egui::Context, p: &'static Palette, actions: &mut Vec<Action>) {
         let panel = egui::SidePanel::left("threads")
             .resizable(false)
@@ -1516,12 +1784,12 @@ impl App {
                     });
                     let pill_w = (ui.available_width() - 34.0).max(80.0);
                     egui::Frame::new().fill(p.input).corner_radius(CornerRadius::same(18)).inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .frame(false)
-                                .hint_text(RichText::new("🔍 Tìm kiếm").color(p.secondary))
-                                .desired_width(pill_w),
-                        );
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                            icons::paint(ui.painter(), Icon::Search, rect, p.secondary);
+                            ui.add(egui::TextEdit::singleline(&mut self.search).frame(false)
+                                .hint_text(RichText::new("Tìm kiếm").color(p.secondary)).desired_width((pill_w - 21.0).max(40.0)));
+                        });
                     });
                 });
                 ui.add_space(6.0);
@@ -1626,7 +1894,7 @@ impl App {
                         let (fg, sub) = if selected { (Color32::WHITE, Color32::from_white_alpha(205)) } else { (p.text, p.secondary) };
                         let av = egui::Rect::from_min_size(egui::pos2(rect.left() + 10.0, rect.center().y - 24.0), Vec2::splat(48.0));
                         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(av));
-                        avatar(&mut child, self.store.thread_avatar(t).as_deref(), &name, &t.id, 48.0);
+                        self.draw_thread_avatar(&mut child, t, &name, 48.0, actions);
 
                         let tx = av.right() + 10.0;
                         let right = rect.right() - 13.0;
@@ -1646,7 +1914,8 @@ impl App {
                             let col = if selected { Color32::WHITE } else if t.muted { p.unread_muted } else { p.unread };
                             ui.painter().circle_filled(egui::pos2(right - 5.0, rect.top() + 42.0), 5.0, col);
                         } else if t.muted {
-                            ui.painter().text(egui::pos2(right - 1.0, rect.top() + 42.0), Align2::RIGHT_CENTER, "🔕", theme::body(12.0), sub);
+                            let mark = egui::Rect::from_center_size(egui::pos2(right - 7.0, rect.top() + 42.0), Vec2::splat(13.0));
+                            icons::paint(ui.painter(), Icon::Muted, mark, sub);
                         }
 
                         if resp.clicked() {
@@ -1737,7 +2006,7 @@ impl App {
 
     fn draw_pin_card(&mut self, ui: &mut egui::Ui, p: &'static Palette, actions: &mut Vec<Action>) {
         egui::Frame::new().fill(p.sidebar).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(12)).show(ui, |ui| {
-            ui.label(RichText::new("🔒 Khôi phục lịch sử chat mã hóa").font(theme::semibold(14.5)).color(p.text));
+            ui.label(RichText::new("Khôi phục lịch sử chat mã hóa").font(theme::semibold(14.5)).color(p.text));
             ui.label(RichText::new("Nhập mã PIN 6 số của Messenger (Lưu trữ an toàn). PIN chỉ gửi đi để khôi phục, không được lưu lại.").size(12.0).color(p.secondary));
             if let Some(e) = &self.store.history_error {
                 let mut t = e.clone();
@@ -1802,7 +2071,7 @@ impl App {
                 .frame(egui::Frame::new().fill(p.sidebar).inner_margin(Margin::symmetric(14, 0)))
                 .show_inside(ui, |ui| {
                     ui.horizontal_centered(|ui| {
-                        avatar(ui, self.store.thread_avatar(&thread).as_deref(), &name, &th_id, 38.0);
+                        self.draw_thread_avatar(ui, &thread, &name, 38.0, &mut actions);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add_space(8.0);
@@ -1812,7 +2081,11 @@ impl App {
                             } else if self.store.presence.get(&key).copied().unwrap_or(false) {
                                 ui.label(RichText::new("đang hoạt động").size(12.5).color(p.accent));
                             } else if is_e2ee {
-                                ui.label(RichText::new("🔒 mã hóa đầu cuối").size(12.5).color(p.secondary));
+                                ui.horizontal(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                                    icons::paint(ui.painter(), Icon::Lock, rect, p.secondary);
+                                    ui.label(RichText::new("mã hóa đầu cuối").size(12.5).color(p.secondary));
+                                });
                             } else if thread.contact.is_none() {
                                 ui.label(RichText::new("nhóm").size(12.5).color(p.secondary));
                             }
@@ -1820,13 +2093,31 @@ impl App {
                         // calls run in Facebook's web client (see russenger-call)
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let can = self.cookies.is_some();
-                            let video = ui.add_enabled(can, egui::Button::new(RichText::new("📹").size(19.0).color(p.secondary)).frame(false)).on_hover_text("Gọi video");
+                            let video = icons::button(ui, Icon::Video, can, 19.0, p.secondary, "Gọi video");
                             if video.clicked() {
                                 actions.push(Action::Call { thread: th_id.clone(), video: true });
                             }
-                            let audio = ui.add_enabled(can, egui::Button::new(RichText::new("📞").size(18.0).color(p.secondary)).frame(false)).on_hover_text("Gọi thoại");
+                            let audio = icons::button(ui, Icon::Phone, can, 18.0, p.secondary, "Gọi thoại");
                             if audio.clicked() {
                                 actions.push(Action::Call { thread: th_id.clone(), video: false });
+                            }
+                            if !is_e2ee {
+                                let state = self.open_history_sync.get(&th_id).map(String::as_str);
+                                let label = match state {
+                                    Some("running") => "Đang đồng bộ…",
+                                    Some("done" | "exhausted") => "Đã đồng bộ 7 ngày",
+                                    Some("partial") => "Tải tiếp lịch sử",
+                                    Some("error") => "Đồng bộ lỗi · Thử lại",
+                                    Some("unavailable") => "Chưa tải được lịch sử · Thử lại",
+                                    _ if self.open_history_cursor(&th_id).is_some() => "Tải tiếp lịch sử",
+                                    _ => "Đồng bộ 7 ngày",
+                                };
+                                let button = egui::Button::new(RichText::new(label).size(12.0).color(p.secondary)).frame(false);
+                                if ui.add_enabled(self.store.ready && state != Some("running") && !self.older_loading.contains(&th_id), button)
+                                    .on_hover_text("Tải lại tin nhắn trong 7 ngày gần nhất").clicked()
+                                {
+                                    actions.push(Action::SyncOpenHistory(th_id.clone()));
+                                }
                             }
                         });
                     });
@@ -1846,7 +2137,7 @@ impl App {
                         self.compose_bar(ui, p, "Sửa tin nhắn", &self.input.clone().chars().take(90).collect::<String>(), &mut actions);
                     }
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new("📎").size(18.0).color(p.secondary)).frame(false)).on_hover_text("Gửi ảnh/tệp").clicked() {
+                        if icons::button(ui, Icon::Attachment, true, 18.0, p.secondary, "Gửi ảnh/tệp").clicked() {
                             actions.push(Action::Attach);
                         }
                         // emoji picker (colour pictures; clicking one appends it to the message)
@@ -2357,7 +2648,7 @@ impl App {
                         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
                         let col = p.secondary.lerp_to_gamma(p.accent, t);
                         ui.painter().circle_filled(rect.center(), 19.0, col);
-                        ui.painter().text(rect.center() + Vec2::new(1.0, 0.0), Align2::CENTER_CENTER, "➤", theme::body(16.0), Color32::WHITE);
+                        icons::paint(ui.painter(), Icon::Send, egui::Rect::from_center_size(rect.center(), Vec2::splat(20.0)), Color32::WHITE);
                         if (enter || resp.clicked()) && has_text {
                             actions.push(Action::Send);
                         }
@@ -2371,9 +2662,27 @@ impl App {
             let is_group = thread.contact.is_none();
             let max_w = (ui.available_width() * 0.68).clamp(220.0, 560.0);
             let stuck = *self.stuck_bottom.get(&th_id).unwrap_or(&true);
-            let user_scrolled = ctx.input(|i| i.smooth_scroll_delta.y != 0.0 || i.raw_scroll_delta.y != 0.0);
-            // a wheel tick must be able to leave the bottom, so no re-alignment in that frame
-            let want_bottom = std::mem::take(&mut self.scroll_bottom) || (stuck && !user_scrolled);
+            let (user_scrolled, wheel_y, pointer) = ctx.input(|i| {
+                (i.smooth_scroll_delta.y != 0.0 || i.raw_scroll_delta.y != 0.0, i.raw_scroll_delta.y, i.pointer.hover_pos())
+            });
+            let mut jump = self.scroll_to_message.take();
+            if let Some((thread, anchor, previous_first)) = &mut self.history_anchor {
+                if thread == &th_id && wheel_y >= 0.0 {
+                    if let Some(first) = msgs.iter().find(|message| !message.pending) {
+                        if first.id != *previous_first {
+                            previous_first.clone_from(&first.id);
+                            if jump.is_none() {
+                                jump = Some((anchor.clone(), Align::Min));
+                            }
+                        }
+                    }
+                } else {
+                    self.history_anchor = None;
+                }
+            }
+            let want_bottom = (std::mem::take(&mut self.scroll_bottom) || (stuck && !user_scrolled)) && jump.is_none();
+            let older_busy = self.older_loading.contains(&th_id) || self.open_history_sync.get(&th_id).is_some_and(|state| state == "running");
+            let older_done = self.store.history_done.contains(&th_id);
             let mut heights = std::mem::take(&mut self.row_heights);
             if heights.len() > 20_000 {
                 heights.clear();
@@ -2388,8 +2697,8 @@ impl App {
             let out = egui::ScrollArea::vertical().id_salt(&th_id).stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
-                    let busy = self.store.history_busy;
-                    let done = self.store.history_done.contains(&th_id);
+                    let busy = self.store.history_busy || older_busy;
+                    let done = older_done;
                     let label = if busy { "Đang tải…" } else if done { "Đã hết tin nhắn cũ" } else { "⟳ Tải tin nhắn cũ hơn" };
                     let b = egui::Button::new(RichText::new(label).size(12.0).color(Color32::WHITE)).fill(p.chip).corner_radius(CornerRadius::same(12));
                     if ui.add_enabled(!busy && !done, b).clicked() {
@@ -2413,6 +2722,15 @@ impl App {
                         ^ (u64::from(is_seen) << 5)
                         ^ (u64::from(m.pending) << 6);
                     let top = ui.cursor().top();
+                    if let Some((target, align)) = &jump {
+                        if target == &m.id {
+                            ui.scroll_to_rect_animation(
+                                egui::Rect::from_min_size(egui::pos2(clip.center().x, top), Vec2::splat(1.0)),
+                                Some(*align),
+                                egui::style::ScrollAnimation::none(),
+                            );
+                        }
+                    }
                     if let Some(&(old_sig, h)) = heights.get(&m.id) {
                         let img_unloaded = imageish && crate::cache::exists(m.media_ref.as_deref().unwrap_or("")) && h < 64.0;
                         // far above or below the visible part: keep the space, skip the drawing
@@ -2430,7 +2748,9 @@ impl App {
                     if is_seen {
                         ui.with_layout(egui::Layout::right_to_left(Align::Min), |ui| {
                             ui.add_space(8.0);
-                            ui.label(RichText::new("✓✓ Đã xem").size(11.0).color(p.secondary));
+                            let label = ui.label(RichText::new("Đã xem").size(11.0).color(p.secondary));
+                            let mark = egui::Rect::from_center_size(label.rect.left_center() - Vec2::new(8.0, 0.0), Vec2::splat(13.0));
+                            icons::paint(ui.painter(), Icon::Checks, mark, p.secondary);
                         });
                     }
                     ui.add_space(if meta.last { 8.0 } else { 2.0 });
@@ -2446,6 +2766,33 @@ impl App {
 
             self.row_heights = heights;
 
+            let at_top = out.state.offset.y <= 4.0;
+            if !at_top || wheel_y < 0.0 {
+                self.top_scrolls = 0;
+                self.last_top_scroll = None;
+            } else if wheel_y > 0.0 && pointer.is_some_and(|pos| out.inner_rect.contains(pos)) {
+                let now = Instant::now();
+                let pause = self.last_top_scroll.replace(now).map(|last| now.duration_since(last));
+                if self.was_at_chat_top && pause.is_none_or(|elapsed| elapsed >= Duration::from_millis(150))
+                    && !older_busy && !older_done && !self.store.history_busy
+                    && self.store.ready && self.backend.is_some()
+                    && (!is_e2ee || self.store.history_state == "restored")
+                {
+                    if pause.is_some_and(|elapsed| elapsed > Duration::from_secs(3)) {
+                        self.top_scrolls = 0;
+                    }
+                    self.top_scrolls += 1;
+                    if self.top_scrolls >= 3 {
+                        self.top_scrolls = 0;
+                        actions.push(Action::LoadEarlier);
+                    }
+                }
+            }
+            self.was_at_chat_top = at_top;
+            if !older_busy && self.history_anchor.is_some() {
+                self.history_anchor = None;
+            }
+
             // scroll-to-bottom floating button
             let max_off = (out.content_size.y - out.inner_rect.height()).max(0.0);
             let away = max_off - out.state.offset.y;
@@ -2459,8 +2806,14 @@ impl App {
                 egui::Area::new(egui::Id::new("to_bottom")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
                     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(42.0), Sense::click());
                     ui.painter().circle_filled(rect.center(), 21.0, p.sidebar);
-                    ui.painter().circle_stroke(rect.center(), 21.0, egui::Stroke::new(1.0, p.separator));
-                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, "⌄", theme::semibold(20.0), p.secondary);
+                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Xuống tin nhắn mới nhất");
+                    let center = rect.center();
+                    ui.painter().circle_stroke(center, 21.0, egui::Stroke::new(1.0_f32, p.separator));
+                    let color = if resp.hovered() { p.text } else { p.secondary };
+                    ui.painter().add(egui::Shape::line(
+                        vec![center + Vec2::new(-7.0, -3.0), center + Vec2::new(0.0, 4.0), center + Vec2::new(7.0, -3.0)],
+                        egui::Stroke::new(2.4_f32, color),
+                    ));
                     if unread_new > 0 {
                         let c = rect.right_top() + Vec2::new(-4.0, 4.0);
                         ui.painter().circle_filled(c, 9.0, p.accent);
@@ -2569,7 +2922,7 @@ impl App {
             ui.painter().text(egui::pos2(screen.left() + 20.0, screen.top() + 30.0), Align2::LEFT_CENTER, format!("{} / {}", v.index + 1, n), theme::semibold(14.0), Color32::from_white_alpha(210));
             let bar = egui::Rect::from_min_size(egui::pos2(screen.right() - 345.0, screen.top() + 12.0), Vec2::new(333.0, 36.0));
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(Layout::right_to_left(Align::Center)));
-            if child.add(egui::Button::new(RichText::new("✕").size(16.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(28)).min_size(Vec2::new(36.0, 34.0))).on_hover_text("Đóng (Esc)").clicked() {
+            if child.add(egui::Button::new(RichText::new("×").size(16.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(28)).min_size(Vec2::new(36.0, 34.0))).on_hover_text("Đóng (Esc)").clicked() {
                 close = true;
             }
             if child.add(egui::Button::new(RichText::new(format!("{:.0}%", v.zoom * 100.0)).color(Color32::WHITE)).fill(Color32::from_white_alpha(28)).min_size(Vec2::new(64.0, 34.0))).on_hover_text("Về kích thước vừa khung (0)").clicked() {
@@ -2631,7 +2984,7 @@ impl App {
                 ui.label(RichText::new(preview).size(12.5).color(p.secondary));
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(egui::Button::new(RichText::new("✕").color(p.secondary)).frame(false)).clicked() {
+                if ui.add(egui::Button::new(RichText::new("×").color(p.secondary)).frame(false)).clicked() {
                     actions.push(Action::CancelCompose);
                 }
             });
@@ -2683,8 +3036,7 @@ impl App {
                     // the "📷 Photo" / "🔗 Link" style label is only a stand-in until the picture or card is available
                     let has_text = !m.text.is_empty() && !((m.media_ref.is_some() || m.link.is_some()) && is_placeholder(&m.text));
                     let time = hhmm(m.ts);
-                    let tick = if mine { if m.pending { " ○" } else { " ✓" } } else { "" };
-                    let meta_str = format!("{time}{tick}");
+                    let status = mine.then_some(if m.pending { Icon::Pending } else { Icon::Check });
                     let time_col = if mine && !bare { p.time_out } else { p.secondary };
 
                     // clickable areas inside the bubble (link card, picture); the bubble itself also
@@ -2694,14 +3046,16 @@ impl App {
                         if !mine && is_group && meta.first {
                             ui.label(RichText::new(self.store.sender_name(&m.sender)).font(theme::semibold(13.0)).color(theme::avatar_color(&m.sender)));
                         }
-                        if let Some(q) = &m.reply_text {
-                            let t: String = q.chars().take(120).collect();
+                        if m.reply_text.is_some() || m.reply_id.is_some() {
+                            let quote = m.reply_text.as_deref().unwrap_or("Tin nhắn được trích dẫn");
+                            let t: String = quote.chars().take(120).collect();
                             let r = egui::Frame::new().fill(p.accent.gamma_multiply(0.18)).corner_radius(CornerRadius::same(4)).inner_margin(Margin { left: 9, right: 6, top: 3, bottom: 3 }).show(ui, |ui| {
                                 ui.label(RichText::new(t).size(12.5).color(if mine { p.text_out } else { p.text }));
                             });
                             let rr = r.response.rect;
                             let bar = if mine { p.text_out } else { p.accent };
                             ui.painter().rect_filled(egui::Rect::from_min_size(rr.left_top(), Vec2::new(3.0, rr.height())), CornerRadius::same(2), bar);
+                            hits.push((rr, Hit::Quote));
                         }
                         // shared link / reel / post: a card with picture, source, title and the link itself
                         if let Some(l) = &m.link {
@@ -2738,14 +3092,18 @@ impl App {
                         }
                         if let (Some(_), Some(r)) = (&m.media_kind, &m.media_ref) {
                             if imageish && !crate::cache::exists(r) {
-                                ui.label(RichText::new("🖼 Ảnh đã bị xóa khỏi bộ nhớ đệm").size(12.5).color(p.secondary));
+                                ui.label(RichText::new("Ảnh đã bị xóa khỏi bộ nhớ đệm").size(12.5).color(p.secondary));
                             } else if imageish {
                                 let resp = ui.add(egui::Image::new(media_uri(r)).fit_to_original_size(1.0).max_size(if is_sticker { Vec2::splat(120.0) } else { Vec2::new(280.0, 320.0) }).corner_radius(CornerRadius::same(if is_sticker { 0 } else { 10 })).sense(Sense::click()));
                                 if !has_text && !is_sticker {
-                                    let g = ui.painter().layout_no_wrap(meta_str.clone(), theme::body(11.0), Color32::WHITE);
-                                    let pill = egui::Rect::from_min_size(resp.rect.right_bottom() - g.size() - Vec2::new(14.0, 8.0), g.size() + Vec2::new(10.0, 4.0));
+                                    let galley = ui.painter().layout_no_wrap(time.clone(), theme::body(11.0), Color32::WHITE);
+                                    let width = galley.size().x + if status.is_some() { 15.0 } else { 0.0 };
+                                    let pill = egui::Rect::from_min_size(
+                                        resp.rect.right_bottom() - Vec2::new(width + 14.0, galley.size().y + 8.0),
+                                        Vec2::new(width + 10.0, galley.size().y + 4.0),
+                                    );
                                     ui.painter().rect_filled(pill, CornerRadius::same(9), Color32::from_black_alpha(120));
-                                    ui.painter().galley(pill.min + Vec2::new(5.0, 2.0), g, Color32::WHITE);
+                                    paint_message_time(ui, pill.min + Vec2::new(5.0, 2.0), galley, Color32::WHITE, status);
                                 }
                                 if !is_sticker {
                                     hits.push((resp.rect, Hit::Image(m.id.clone())));
@@ -2754,84 +3112,100 @@ impl App {
                                 let label = match kind.as_str() {
                                     "video" => "▶ Phát video",
                                     "audio" => "▶ Phát âm thanh",
-                                    _ => "💾 Lưu tệp…",
+                                    _ => "Lưu tệp…",
                                 };
                                 if !crate::cache::exists(r) {
-                                    ui.label(RichText::new("📎 Tệp đã bị xóa khỏi bộ nhớ đệm").size(12.5).color(p.secondary));
+                                    ui.label(RichText::new("Tệp đã bị xóa khỏi bộ nhớ đệm").size(12.5).color(p.secondary));
                                 } else {
                                     let b = ui.button(label);
                                     hits.push((b.rect, if matches!(kind.as_str(), "video" | "audio") { Hit::Play(r.clone()) } else { Hit::File(r.clone()) }));
                                 }
                             }
                         }
-                        if has_text && crate::emoji::contains_emoji(&m.text) {
-                            // text mixed with emoji pictures; a spacer reserves room for the time
-                            let size = if emoji_big { 40.0 } else { 19.0 };
+                        if has_text {
+                            let text = if m.text == "💟 Sticker" { "Sticker" } else { &m.text };
                             let fg = if mine && !bare { p.text_out } else { p.text };
-                            let time_w = ui.painter().layout_no_wrap(meta_str.clone(), theme::body(11.0), Color32::WHITE).size().x + 8.0;
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
-                                for seg in crate::emoji::split(&m.text) {
-                                    match seg {
-                                        crate::emoji::Seg::Text(t) => {
-                                            ui.label(RichText::new(t).font(theme::body(14.5)).color(fg));
-                                        }
-                                        crate::emoji::Seg::Emoji(e) => {
-                                            ui.add(egui::Image::new(crate::emoji::uri(e)).fit_to_exact_size(Vec2::splat(size)).alt_text(e.to_string()));
+                            if crate::emoji::contains_emoji(text) {
+                                let size = if emoji_big { 40.0 } else { 19.0 };
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+                                    for seg in crate::emoji::split(text) {
+                                        match seg {
+                                            crate::emoji::Seg::Text(t) => {
+                                                ui.label(RichText::new(t).font(theme::body(14.5)).color(fg));
+                                            }
+                                            crate::emoji::Seg::Emoji(e) => {
+                                                ui.add(egui::Image::new(crate::emoji::uri(e)).fit_to_exact_size(Vec2::splat(size)).alt_text(e.to_string()));
+                                            }
                                         }
                                     }
-                                }
-                                if !emoji_big {
-                                    ui.add_space(time_w);
-                                }
-                            });
-                            if emoji_big {
-                                ui.label(RichText::new(&meta_str).size(11.0).color(time_col));
+                                });
+                            } else {
+                                ui.add(egui::Label::new(RichText::new(text).font(theme::body(14.5)).color(fg)).wrap());
                             }
-                        } else if has_text {
-                            // invisible spacer reserves room for the time painted at the bottom-right
-                            let mut job = LayoutJob::default();
-                            job.append(&m.text, 0.0, TextFormat { font_id: theme::body(14.5), color: if mine { p.text_out } else { p.text }, ..Default::default() });
-                            job.append(&format!("   {meta_str}"), 0.0, TextFormat { font_id: theme::body(11.0), color: Color32::TRANSPARENT, ..Default::default() });
-                            ui.add(egui::Label::new(job).wrap());
-                        } else if !imageish || is_sticker {
-                            // card / file / sticker only: no text line to hang the time on
-                            ui.label(RichText::new(&meta_str).size(11.0).color(time_col));
+                        }
+                        if has_text || !imageish || is_sticker {
+                            let galley = ui.painter().layout_no_wrap(time.clone(), theme::body(11.0), time_col);
+                            let width = galley.size().x + if status.is_some() { 15.0 } else { 0.0 };
+                            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, galley.size().y.max(12.0)), Sense::hover());
+                            paint_message_time(ui, rect.min, galley, time_col, status);
                         }
                     });
                     let rect = frame_resp.response.rect;
-                    if has_text && !emoji_big {
-                        ui.painter().text(rect.right_bottom() - Vec2::new(10.0, 5.0), Align2::RIGHT_BOTTOM, meta_str, theme::body(11.0), time_col);
+                    if self.quote_highlight.as_ref().is_some_and(|(id, until)| id == &m.id && Instant::now() < *until) {
+                        ui.painter().rect_stroke(rect, cr, egui::Stroke::new(2.0_f32, p.accent), egui::StrokeKind::Inside);
                     }
 
-                    // reactions as pills
+                    // A reaction pill toggles that emoji and lists its actors on hover.
                     if !m.reactions.is_empty() {
-                        let mut counts: Vec<(String, usize, bool)> = Vec::new();
-                        for (actor, e) in &m.reactions {
-                            let me = *actor == self.store.self_id;
-                            match counts.iter_mut().find(|(x, _, _)| x == e) {
-                                Some(c) => {
-                                    c.1 += 1;
-                                    c.2 |= me;
-                                }
-                                None => counts.push((e.clone(), 1, me)),
+                        let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+                        for (actor, emoji) in &m.reactions {
+                            if let Some((_, actors)) = groups.iter_mut().find(|(key, _)| *key == emoji) {
+                                actors.push(actor);
+                            } else {
+                                groups.push((emoji, vec![actor]));
                             }
                         }
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            for (e, n, me) in counts {
-                                let col = if me { p.accent } else { p.input };
-                                let pic = egui::Image::new(crate::emoji::uri(&e)).fit_to_exact_size(Vec2::splat(16.0)).alt_text(e.clone());
-                                let b = if n > 1 {
-                                    egui::Button::image_and_text(pic, RichText::new(n.to_string()).size(12.5).color(if me { Color32::WHITE } else { p.text }))
+                            for (emoji, actors) in groups {
+                                let mine_here = actors.contains(&self.store.self_id.as_str());
+                                let color = if mine_here { p.accent } else { p.input };
+                                let count = actors.len();
+                                let icon = egui::Image::new(crate::emoji::uri(emoji)).fit_to_exact_size(Vec2::splat(16.0)).alt_text(emoji);
+                                let button = if count > 1 {
+                                    let text = RichText::new(count.to_string()).size(12.5).color(if mine_here { Color32::WHITE } else { p.text });
+                                    egui::Button::image_and_text(icon, text)
                                 } else {
-                                    egui::Button::image(pic)
+                                    egui::Button::image(icon)
                                 }
-                                .fill(col)
+                                .fill(color)
                                 .corner_radius(CornerRadius::same(12))
                                 .small();
-                                if ui.add(b).clicked() {
-                                    actions.push(Action::React { thread: th.to_string(), id: m.id.clone(), emoji: if me { String::new() } else { e }, from_me: mine });
+                                let response = ui.add(button).on_hover_ui(|ui| {
+                                    let mut names: Vec<&str> = actors.iter().map(|&actor| {
+                                        if actor == self.store.self_id {
+                                            "Bạn"
+                                        } else if let Some(name) = self.store.contacts.get(actor) {
+                                            name.as_str()
+                                        } else {
+                                            if !self.requested.contains(actor) {
+                                                actions.push(Action::ResolveReactionActor(actor.to_owned()));
+                                            }
+                                            "Thành viên chưa rõ tên"
+                                        }
+                                    }).collect();
+                                    names.sort_unstable();
+                                    ui.set_max_width(240.0);
+                                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                                        for name in names {
+                                            ui.label(name);
+                                        }
+                                    });
+                                });
+                                if response.clicked() {
+                                    let emoji = if mine_here { String::new() } else { emoji.to_owned() };
+                                    actions.push(Action::React { thread: th.to_string(), id: m.id.clone(), emoji, from_me: mine });
                                 }
                             }
                         });
@@ -2845,6 +3219,7 @@ impl App {
                         if resp.clicked() {
                             if let Some((_, hit)) = hits.iter().find(|(r, _)| r.contains(pos)) {
                                 actions.push(match hit {
+                                    Hit::Quote => Action::JumpToQuote { thread: th.to_string(), reply: m.id.clone() },
                                     Hit::Url(u) => Action::OpenUrl(u.clone()),
                                     Hit::File(u) => Action::SaveFile(u.clone()),
                                     Hit::Image(id) => Action::ViewImage { thread: th.to_string(), id: id.clone() },
@@ -2881,7 +3256,7 @@ impl App {
                             ui.close_menu();
                         }
                         if mine && !m.pending {
-                            if !m.text.is_empty() && ui.button("✎ Sửa").clicked() {
+                            if !m.text.is_empty() && ui.button("Sửa").clicked() {
                                 actions.push(Action::StartEdit { id: m.id.clone(), text: m.text.clone() });
                                 ui.close_menu();
                             }
@@ -2910,6 +3285,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // a click on a toast: bring the window forward and open that chat
         if let Some(th) = notify::take_open_request() {
+            #[cfg(windows)]
             match self.hwnd {
                 Some(h) if crate::tray::PARKED.load(std::sync::atomic::Ordering::Relaxed) => crate::tray::show(h),
                 _ => {
@@ -2917,12 +3293,15 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
+            #[cfg(target_os = "macos")]
+            crate::tray::show(ctx);
             if !th.is_empty() && th != "summary" && self.screen == Screen::Main && self.store.threads.contains_key(&th) {
                 self.handle(Action::Select(th));
             }
         }
         self.pump_events();
         self.pump_login();
+        self.check_encrypted_inbox_history();
 
         // resolve names/avatars for people we only know by id
         if self.store.ready && self.backend.is_some() {
@@ -2992,12 +3371,20 @@ impl eframe::App for App {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        if crate::notify::QUIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         // the close button hides the window into the tray instead of quitting
         if self.tray_on && self.tray.is_some() && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            #[cfg(windows)]
             if let Some(h) = self.hwnd {
                 crate::tray::hide(h);
             }
+            #[cfg(target_os = "macos")]
+            crate::tray::hide(ctx);
         }
 
         // files dragged onto the window, and Ctrl+V with a picture on the clipboard
@@ -3007,14 +3394,21 @@ impl eframe::App for App {
                     self.outgoing.push((p, false));
                 }
             }
-            let down = ctx.input(|i| i.focused) && unsafe {
-                use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-                GetAsyncKeyState(0x11) < 0 && GetAsyncKeyState(0x56) < 0
-            };
-            if down && !self.paste_down {
+            #[cfg(windows)]
+            {
+                let down = ctx.input(|i| i.focused) && unsafe {
+                    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                    GetAsyncKeyState(0x11) < 0 && GetAsyncKeyState(0x56) < 0
+                };
+                if down && !self.paste_down {
+                    self.paste_clipboard_image();
+                }
+                self.paste_down = down;
+            }
+            #[cfg(target_os = "macos")]
+            if ctx.input(|i| i.focused && i.modifiers.command && i.key_pressed(egui::Key::V)) {
                 self.paste_clipboard_image();
             }
-            self.paste_down = down;
         }
 
         // keep the open thread read while the window is focused (incl. after refreshThread brings in new messages)

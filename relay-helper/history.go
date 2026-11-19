@@ -40,8 +40,7 @@ var (
 )
 
 func historyFile() string {
-	dir, _ := os.UserConfigDir()
-	d := filepath.Join(dir, "Relay")
+	d := dataDir()
 	_ = os.MkdirAll(d, 0o700)
 	return filepath.Join(d, "history-device.json")
 }
@@ -362,22 +361,49 @@ func fetchEncryptedHistoryPage(thread string, before int64, countLimit int, emit
 	hasMore = page.Range.HasMoreBefore != nil && *page.Range.HasMoreBefore
 	nextBefore = page.Range.Before
 	if emitPageEvent {
-		// If we reached the beginning of E2EE Secure Storage and this chat has a pre-cutover
-		// open thread, pull older plaintext history before closing out pagination.
-		if !hasMore {
-			if openID := getOpenThreadForE2EE(toInt64(chatUser)); openID != 0 {
-				go loadEarlier(thread, "", nextBefore, false)
-			}
-		}
-		emit(map[string]any{"type": "historyPage", "thread": thread, "before": nextBefore, "hasMore": hasMore, "count": count})
-		log.Info().Str("thread", thread).Int("count", count).Bool("hasMore", hasMore).Msg("encrypted history page")
+		emitEncryptedHistoryPage(thread, nextBefore, hasMore, count)
 	}
 	return nextBefore, hasMore, count
 }
 
-// loadEncryptedHistory fetches one page (up to 50 messages) older than `before` (ms).
-func loadEncryptedHistory(thread string, before int64) {
-	fetchEncryptedHistoryPage(thread, before, 50, true)
+func emitEncryptedHistoryPage(thread string, before int64, hasMore bool, count int) {
+	if !hasMore && getOpenThreadForE2EE(toInt64(strings.TrimPrefix(thread, "e:"))) != 0 {
+		// The older plaintext segment lives on a separate Lightspeed thread.
+		go loadEarlier(thread, "", before, false)
+	}
+	emit(map[string]any{"type": "historyPage", "thread": thread, "before": before, "hasMore": hasMore, "count": count})
+}
+
+// A user-facing history request walks up to three days. Attachment repairs
+// continue to use a single page around their requested timestamp.
+func loadEncryptedHistory(thread string, before int64, window bool) {
+	if !window || !hasHistoryDevice() {
+		fetchEncryptedHistoryPage(thread, before, 50, true)
+		return
+	}
+	mu := threadRefreshLock(thread)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if before <= 0 {
+		before = time.Now().Add(time.Minute).UnixMilli()
+	}
+	cutoff := before - olderHistoryWindow.Milliseconds()
+	deadline := time.Now().Add(time.Minute)
+	total := 0
+	hasMore := true
+	for range 50 {
+		next, more, count := fetchEncryptedHistoryPage(thread, before, 50, false)
+		total += count
+		if next <= 0 || next >= before {
+			break
+		}
+		before, hasMore = next, more
+		if !hasMore || before <= cutoff || time.Now().After(deadline) {
+			break
+		}
+	}
+	emitEncryptedHistoryPage(thread, before, hasMore, total)
 }
 
 // refreshEncryptedHistory fetches the newest page(s) of Secure Storage when opening an
@@ -386,6 +412,7 @@ func loadEncryptedHistory(thread string, before int64) {
 func refreshEncryptedHistory(thread string, sinceTs int64) {
 	nextBefore, hasMore, _ := fetchEncryptedHistoryPage(thread, 0, 35, false)
 	if sinceTs > 0 {
+		sinceTs = max(sinceTs, time.Now().Add(-recentHistoryWindow).UnixMilli())
 		for page := 0; page < 3 && hasMore && nextBefore > sinceTs; page++ {
 			prev := nextBefore
 			nextBefore, hasMore, _ = fetchEncryptedHistoryPage(thread, nextBefore, 50, false)

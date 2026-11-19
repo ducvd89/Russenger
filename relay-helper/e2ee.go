@@ -51,8 +51,7 @@ func e2eeChatJID(fbid string) types.JID {
 // setupE2EE connects the WhatsApp-protocol encrypted client that carries
 // Messenger's E2EE (personal) chats. Registers a device once and persists it.
 func setupE2EE(ctx context.Context, fbid int64) error {
-	dir, _ := os.UserConfigDir()
-	storeDir := filepath.Join(dir, "Relay")
+	storeDir := dataDir()
 	_ = os.MkdirAll(storeDir, 0o700)
 	addr := "file:" + filepath.Join(storeDir, "wadevice.db") +
 		"?_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)"
@@ -1395,8 +1394,7 @@ func sniffImageExt(b []byte) string {
 }
 
 func saveMedia(id, ext string, data []byte) string {
-	dir, _ := os.UserConfigDir()
-	mdir := filepath.Join(dir, "Relay", "media")
+	mdir := filepath.Join(dataDir(), "media")
 	_ = os.MkdirAll(mdir, 0o700)
 	safe := strings.NewReplacer("/", "_", ":", "_", "$", "_", ".", "_", "#", "_").Replace(id)
 	p := filepath.Join(mdir, safe+"."+ext)
