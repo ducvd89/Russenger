@@ -24,6 +24,43 @@ pub struct Thread {
     pub synced_read_up_to: f64,
 }
 
+impl Thread {
+    pub fn has_group_type(&self) -> bool {
+        Self::is_group_type(self.ttype)
+    }
+
+    fn is_group_type(kind: i64) -> bool {
+        matches!(kind, 2 | 3 | 8 | 11 | 16..=26 | 150..=155 | 200)
+    }
+
+    pub fn has_direct_type(&self) -> bool {
+        matches!(self.ttype, 1 | 5 | 7 | 10 | 13 | 15 | 201)
+    }
+
+    pub fn is_group(&self) -> bool {
+        self.has_group_type() || (!self.has_direct_type() && self.contact.is_none())
+    }
+
+    fn normalize_contact(&mut self) {
+        if self.has_group_type() {
+            self.contact = None;
+        }
+    }
+
+    fn apply_identity(&mut self, event: &Value) {
+        if let Some(kind) = event["ttype"].as_i64().filter(|kind| *kind > 0) {
+            // Preserve a specific group kind when an encrypted snapshot only knows it is a group.
+            if !self.has_group_type() || (kind != 16 && Self::is_group_type(kind)) {
+                self.ttype = kind;
+            }
+        }
+        if let Some(contact) = opt(event, "contact") {
+            self.contact = Some(contact);
+        }
+        self.normalize_contact();
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Community {
     pub name: String,
@@ -153,7 +190,11 @@ impl Store {
         let mut st = Store::default();
         if let Some(db) = &db {
             st.pre_sync_max_ts = db.max_message_ts_by_thread();
-            for t in db.load_threads() {
+            for mut t in db.load_threads() {
+                if t.has_group_type() && t.contact.is_some() {
+                    t.normalize_contact();
+                    db.save_thread(&t);
+                }
                 st.threads.insert(t.id.clone(), t);
             }
             for (id, kind, r) in db.load_media() {
@@ -226,11 +267,14 @@ impl Store {
             if t.contact.is_none() {
                 t.contact = old_t.contact;
             }
+            if t.ttype == 0 || (Thread::is_group_type(old_t.ttype) && !t.has_group_type()) {
+                t.ttype = old_t.ttype;
+            }
             if t.folder.is_empty() && !old_t.folder.is_empty() {
                 t.folder = old_t.folder;
-                t.ttype = old_t.ttype;
                 t.parent = old_t.parent;
             }
+            t.normalize_contact();
             t.muted |= old_t.muted;
             t.read_up_to = t.read_up_to.max(old_t.read_up_to);
             t.synced_read_up_to = t.synced_read_up_to.max(old_t.synced_read_up_to);
@@ -562,6 +606,7 @@ impl Store {
                 let from_lightspeed = ev.get("folder").is_some();
                 let t = self.threads.entry(id.clone()).or_default();
                 t.id = id;
+                t.apply_identity(ev);
                 if is_partial {
                     if ev.get("name").is_some() {
                         let n = s(ev, "name");
@@ -583,9 +628,6 @@ impl Store {
                     }
                     if ev.get("parent").is_some() {
                         t.parent = s(ev, "parent");
-                    }
-                    if let Some(contact) = opt(ev, "contact") {
-                        t.contact = Some(contact);
                     }
                     let pts = f(ev, "lastActivity");
                     let remote_read = f(ev, "readUpTo");
@@ -636,13 +678,9 @@ impl Store {
                 if ev.get("muted").is_some() {
                     t.muted = b(ev, "muted");
                 }
-                if let Some(c) = opt(ev, "contact") {
-                    t.contact = Some(c);
-                }
-                // encrypted-thread events from WhatsApp carry no folder/type: keep what we had
+                // WhatsApp events do not supply Lightspeed folders.
                 if from_lightspeed {
                     t.folder = s(ev, "folder");
-                    t.ttype = ev.get("ttype").and_then(Value::as_i64).unwrap_or(t.ttype);
                     t.parent = s(ev, "parent");
                 }
                 let ev_unread = b(ev, "unread");
@@ -705,8 +743,7 @@ impl Store {
                     }
                     if c != self.self_id {
                         if let Some(t) = self.threads.get_mut(&th) {
-                            let is_group = matches!(t.ttype, 2 | 8 | 11 | 16) || (t.ttype >= 17 && t.ttype <= 26);
-                            if t.contact.is_none() && !is_group {
+                            if t.contact.is_none() && t.has_direct_type() {
                                 t.contact = Some(c);
                             }
                         }
@@ -985,7 +1022,7 @@ impl Store {
         if ts <= 0.0 || ts + tolerance < t.last_activity {
             return;
         }
-        let group = t.contact.is_none();
+        let group = t.is_group();
         let snippet = if sender == self.self_id {
             format!("Bạn: {text}")
         } else if group {
@@ -1035,6 +1072,9 @@ impl Store {
     }
 
     pub fn thread_contact_avatar(&self, t: &Thread) -> Option<&str> {
+        if t.has_group_type() {
+            return None;
+        }
         let key = t.contact.as_deref().unwrap_or_else(|| t.id.trim_start_matches("e:"));
         self.avatars.get(key).map(String::as_str)
     }
@@ -1051,6 +1091,32 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn repairs_cached_groups_with_a_stale_direct_contact() {
+        let db = Db::open_memory().unwrap();
+        db.save_thread(&Thread { id: "group".into(), ttype: 2, contact: Some("member".into()), ..Default::default() });
+        let st = Store::with_db(Some(db));
+        assert!(st.threads["group"].is_group());
+        assert!(st.threads["group"].contact.is_none());
+        assert!(st.db.as_ref().unwrap().load_threads()[0].contact.is_none());
+    }
+
+    #[test]
+    fn group_metadata_wins_over_provisional_participant_and_merge() {
+        let mut st = Store::default();
+        st.apply(&json!({"type":"thread","id":"123","partial":true,"name":"Provisional","contact":"456"}));
+        st.apply(&json!({"type":"thread","id":"e:123","partial":true,"ttype":16}));
+        st.apply(&json!({"type":"participant","thread":"e:123","contact":"789"}));
+        st.apply(&json!({"type":"thread","id":"e:123","folder":"inbox","ttype":0,"contact":"456"}));
+        assert!(st.threads["e:123"].is_group());
+        assert!(st.threads["e:123"].contact.is_none());
+
+        st.apply(&json!({"type":"thread","id":"direct","ttype":1}));
+        st.apply(&json!({"type":"participant","thread":"direct","contact":"456"}));
+        assert!(!st.threads["direct"].is_group());
+        assert_eq!(st.threads["direct"].contact.as_deref(), Some("456"));
+    }
 
     #[test]
     fn restores_sticker_attachment_from_the_catalog() {

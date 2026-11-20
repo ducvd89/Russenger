@@ -44,6 +44,7 @@ enum Action {
     SaveFile(String),
     Settings,
     Copy(String),
+    CopyImage(String),
     Logout,
     Retry,
     RestoreHistory,
@@ -94,7 +95,7 @@ enum Hit {
 
 /// Full-window picture viewer with zoom, pan and previous/next.
 struct Viewer {
-    /// (message id, uri) of every picture in the thread
+    /// (message id, original media source) of every picture in the thread
     items: Vec<(String, String)>,
     index: usize,
     zoom: f32,
@@ -120,6 +121,8 @@ pub struct App {
     reconnect_at: Option<Instant>,
     pick_tx: Sender<(String, PathBuf)>,
     pick_rx: Receiver<(String, PathBuf)>,
+    image_copy_rx: Option<Receiver<Result<image::RgbaImage, String>>>,
+    image_copy_feedback: Option<(&'static str, Instant)>,
     requested: HashSet<String>,
     resolved_avatars: std::collections::HashMap<String, (String, String)>,
     avatar_attempts: std::collections::HashMap<String, Instant>,
@@ -653,6 +656,8 @@ impl App {
             reconnect_at: None,
             pick_tx,
             pick_rx,
+            image_copy_rx: None,
+            image_copy_feedback: None,
             requested: HashSet::new(),
             resolved_avatars: Default::default(),
             avatar_attempts: Default::default(),
@@ -1382,7 +1387,7 @@ impl App {
                     return;
                 }
                 if let Some(chat) = self.store.threads.get(&thread) {
-                    let contact = chat.contact.as_deref().or_else(|| matches!(chat.ttype, 1 | 7 | 13 | 15)
+                    let contact = chat.contact.as_deref().or_else(|| chat.has_direct_type()
                         .then(|| thread.trim_start_matches("e:")));
                     let request = json!({"cmd":"resolveThreadAvatar", "thread":thread, "picture":chat.picture, "contact":contact.unwrap_or("")});
                     self.avatar_attempts.insert(thread, Instant::now());
@@ -1461,7 +1466,7 @@ impl App {
                     .map(|l| {
                         l.iter()
                             .filter(|m| matches!(m.media_kind.as_deref(), Some("photo" | "image" | "gif")))
-                            .filter_map(|m| m.media_ref.as_ref().map(|r| (m.id.clone(), media_uri(r))))
+                            .filter_map(|m| m.media_ref.as_ref().map(|r| (m.id.clone(), r.clone())))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1469,7 +1474,12 @@ impl App {
                     self.viewer = Some(Viewer { items, index, zoom: 1.0, offset: Vec2::ZERO });
                 }
             }
-            Action::Copy(t) => self.ctx.copy_text(t),
+            Action::Copy(t) => {
+                self.image_copy_rx = None;
+                self.image_copy_feedback = None;
+                self.ctx.copy_text(t);
+            }
+            Action::CopyImage(source) => self.copy_image(source),
             Action::Logout => self.logout(),
             Action::Retry => self.start_backend(),
             Action::RestoreHistory => {
@@ -1493,6 +1503,67 @@ impl App {
     }
 
     // ---------- UI ----------
+
+    fn copy_image(&mut self, source: String) {
+        let loaded = [media_uri(&source), source.clone()].into_iter().find_map(|uri| {
+            match self.ctx.try_load_bytes(&uri) {
+                Ok(egui::load::BytesPoll::Ready { bytes, .. }) => Some(bytes),
+                _ => None,
+            }
+        });
+        let (tx, rx) = channel();
+        self.image_copy_rx = Some(rx);
+        self.image_copy_feedback = None;
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let image = loaded.as_ref().and_then(|bytes| cache::decode_image(bytes).ok())
+                .map_or_else(|| cache::read_image(&source), Ok);
+            let _ = tx.send(image);
+            ctx.request_repaint();
+        });
+    }
+
+    fn pump_image_copy(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = &self.image_copy_rx else { return };
+        let feedback = match rx.try_recv() {
+            Ok(Ok(image)) => {
+                let (width, height) = image.dimensions();
+                let data = arboard::ImageData { width: width as usize, height: height as usize, bytes: image.into_raw().into() };
+                if arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_image(data)).is_ok() {
+                    "Đã sao chép ảnh"
+                } else {
+                    "Không thể ghi ảnh vào clipboard"
+                }
+            }
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => "Không tải được ảnh để sao chép",
+            Err(TryRecvError::Empty) => return,
+        };
+        self.image_copy_rx = None;
+        self.image_copy_feedback = Some((feedback, Instant::now() + Duration::from_secs(3)));
+    }
+
+    fn draw_image_copy_status(&self, ctx: &egui::Context) {
+        let label = if self.image_copy_rx.is_some() {
+            "Đang sao chép ảnh…"
+        } else if let Some((feedback, until)) = self.image_copy_feedback {
+            let now = Instant::now();
+            if now >= until {
+                return;
+            }
+            ctx.request_repaint_after(until - now);
+            feedback
+        } else {
+            return;
+        };
+        egui::Area::new(egui::Id::new("image_copy_status"))
+            .order(egui::Order::Tooltip)
+            .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -62.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| { ui.label(label); });
+            });
+    }
 
     /// A picture on the clipboard (and no text) becomes a file waiting for "send?".
     fn paste_clipboard_image(&mut self) {
@@ -2086,7 +2157,7 @@ impl App {
                                     icons::paint(ui.painter(), Icon::Lock, rect, p.secondary);
                                     ui.label(RichText::new("mã hóa đầu cuối").size(12.5).color(p.secondary));
                                 });
-                            } else if thread.contact.is_none() {
+                            } else if thread.is_group() {
                                 ui.label(RichText::new("nhóm").size(12.5).color(p.secondary));
                             }
                         });
@@ -2223,7 +2294,7 @@ impl App {
                             }
                         }
                         let id = egui::Id::new("composer");
-                        let is_group_chat = thread.contact.is_none();
+                        let is_group_chat = thread.is_group();
 
                         // Detect active `@query` at the current text cursor for @mention autocomplete.
                         let cur_chars = egui::text_edit::TextEditState::load(ui.ctx(), id)
@@ -2659,7 +2730,7 @@ impl App {
             let empty: Vec<Message> = Vec::new();
             let msgs = self.store.messages.get(&th_id).unwrap_or(&empty);
             let metas = row_metas(msgs);
-            let is_group = thread.contact.is_none();
+            let is_group = thread.is_group();
             let max_w = (ui.available_width() * 0.68).clamp(220.0, 560.0);
             let stuck = *self.stuck_bottom.get(&th_id).unwrap_or(&true);
             let (user_scrolled, wheel_y, pointer) = ctx.input(|i| {
@@ -2720,7 +2791,8 @@ impl App {
                         ^ (u64::from(meta.last) << 3)
                         ^ (u64::from(meta.new_day) << 4)
                         ^ (u64::from(is_seen) << 5)
-                        ^ (u64::from(m.pending) << 6);
+                        ^ (u64::from(m.pending) << 6)
+                        ^ (u64::from(is_group) << 7);
                     let top = ui.cursor().top();
                     if let Some((target, align)) = &jump {
                         if target == &m.id {
@@ -2837,6 +2909,7 @@ impl App {
         let Some(v) = self.viewer.as_mut() else { return };
         let screen = ctx.screen_rect();
         let mut close = false;
+        let mut copy_image = None;
         let n = v.items.len();
 
         ctx.input_mut(|i| {
@@ -2869,7 +2942,7 @@ impl App {
             let bg = ui.allocate_rect(screen, Sense::click_and_drag());
             ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(238));
 
-            let uri = v.items[v.index].1.clone();
+            let uri = media_uri(&v.items[v.index].1);
             let mut img_rect = egui::Rect::NOTHING;
             match ctx.try_load_texture(&uri, egui::TextureOptions::default(), egui::SizeHint::default()) {
                 Ok(egui::load::TexturePoll::Ready { texture }) => {
@@ -2918,6 +2991,13 @@ impl App {
                 close = true;
             }
 
+            bg.context_menu(|ui| {
+                if ui.button("Sao chép ảnh").clicked() {
+                    copy_image = Some(v.items[v.index].1.clone());
+                    ui.close_menu();
+                }
+            });
+
             // top bar: counter on the left, zoom controls and close on the right
             ui.painter().text(egui::pos2(screen.left() + 20.0, screen.top() + 30.0), Align2::LEFT_CENTER, format!("{} / {}", v.index + 1, n), theme::semibold(14.0), Color32::from_white_alpha(210));
             let bar = egui::Rect::from_min_size(egui::pos2(screen.right() - 345.0, screen.top() + 12.0), Vec2::new(333.0, 36.0));
@@ -2937,7 +3017,7 @@ impl App {
             }
             if child.add(egui::Button::new(RichText::new("Lưu").color(Color32::WHITE)).fill(Color32::from_white_alpha(28)).min_size(Vec2::new(56.0, 34.0))).on_hover_text("Lưu ảnh về máy").clicked() {
                 // local file or remote url; saved from a worker thread so the window never blocks
-                let uri = v.items[v.index].1.clone();
+                let uri = media_uri(&v.items[v.index].1);
                 let source = uri.strip_prefix("file://").map(|p| p.to_string()).unwrap_or(uri);
                 let ext = std::path::Path::new(source.split(['?', '#']).next().unwrap_or("")).extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_string();
                 std::thread::spawn(move || {
@@ -2971,6 +3051,9 @@ impl App {
 
         if close {
             self.viewer = None;
+        }
+        if let Some(source) = copy_image {
+            self.handle(Action::CopyImage(source));
         }
     }
 
@@ -3251,7 +3334,15 @@ impl App {
                             actions.push(Action::StartReply { id: m.id.clone(), text: m.text.clone(), sender: m.sender.clone() });
                             ui.close_menu();
                         }
-                        if !m.text.is_empty() && ui.button("Sao chép").clicked() {
+                        if imageish {
+                            if let Some(source) = &m.media_ref {
+                                if ui.button("Sao chép ảnh").clicked() {
+                                    actions.push(Action::CopyImage(source.clone()));
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                        if !m.text.is_empty() && !is_placeholder(&m.text) && ui.button(if imageish { "Sao chép chú thích" } else { "Sao chép" }).clicked() {
                             actions.push(Action::Copy(m.text.clone()));
                             ui.close_menu();
                         }
@@ -3301,6 +3392,7 @@ impl eframe::App for App {
         }
         self.pump_events();
         self.pump_login();
+        self.pump_image_copy();
         self.check_encrypted_inbox_history();
 
         // resolve names/avatars for people we only know by id
@@ -3488,6 +3580,7 @@ impl eframe::App for App {
                 if self.viewer.is_some() {
                     self.draw_viewer(ctx);
                 }
+                self.draw_image_copy_status(ctx);
             }
         }
     }

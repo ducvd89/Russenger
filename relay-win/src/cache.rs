@@ -124,7 +124,11 @@ fn lookup(k: &str) -> Option<PathBuf> {
 }
 
 fn fetch(url: &str, max: u64) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url).timeout(Duration::from_secs(120)).call().map_err(|e| e.to_string())?;
+    fetch_with_timeout(url, max, Duration::from_secs(120))
+}
+
+fn fetch_with_timeout(url: &str, max: u64, timeout: Duration) -> Result<Vec<u8>, String> {
+    let resp = ureq::get(url).timeout(timeout).call().map_err(|e| e.to_string())?;
     let mut data = Vec::new();
     resp.into_reader().take(max + 1).read_to_end(&mut data).map_err(|e| e.to_string())?;
     if data.is_empty() || data.len() as u64 > max {
@@ -234,6 +238,33 @@ pub fn image_uri(url: &str) -> String {
     }
     schedule(url, k, cache_dir(), IMAGE_MAX, "jpg", true);
     url.to_string()
+}
+
+/// Load the original image bytes for copying even if the rendered texture was resized.
+pub fn read_image(source: &str) -> Result<image::RgbaImage, String> {
+    let local = |path: &Path| {
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(IMAGE_MAX + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        decode_image(&bytes)
+    };
+    if source.starts_with("https://") || source.starts_with("http://") {
+        if let Some(path) = lookup(&key(source)) {
+            if let Ok(image) = local(&path) {
+                return Ok(image);
+            }
+        }
+        decode_image(&fetch_with_timeout(source, IMAGE_MAX, Duration::from_secs(15))?)
+    } else {
+        local(Path::new(source))
+    }
+}
+
+pub fn decode_image(bytes: &[u8]) -> Result<image::RgbaImage, String> {
+    if bytes.len() as u64 > IMAGE_MAX {
+        return Err("image exceeds cache size limit".into());
+    }
+    image::load_from_memory(bytes).map(|image| image.into_rgba8()).map_err(|e| e.to_string())
 }
 
 /// Same for emoji pictures (never trimmed).
@@ -355,5 +386,19 @@ pub fn save_to(source: &str, dest: &Path) -> Result<(), String> {
         std::fs::write(dest, fetch(source, VIDEO_MAX)?).map_err(|e| e.to_string())
     } else {
         std::fs::copy(source, dest).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_decode_preserves_pixels_and_alpha() {
+        let source = image::RgbaImage::from_pixel(2, 3, image::Rgba([31, 42, 53, 127]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        source.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert_eq!(decode_image(png.get_ref()).unwrap(), source);
+        assert!(decode_image(b"Photo").is_err());
     }
 }

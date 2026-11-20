@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
+	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/armadilloutil"
 	waArmadilloApplication "go.mau.fi/whatsmeow/proto/waArmadilloApplication"
@@ -1496,7 +1497,10 @@ func handleFBMessage(e *events.FBMessage) {
 	if wm.readUpTo > 0 {
 		thEv["readUpTo"] = wm.readUpTo
 	}
-	if !isGroup {
+	if isGroup {
+		thEv["ttype"] = int64(table.ENCRYPTED_OVER_WA_GROUP)
+	} else {
+		thEv["ttype"] = int64(table.ENCRYPTED_OVER_WA_ONE_TO_ONE)
 		thEv["contact"] = e.Info.Chat.User
 	}
 	emit(thEv)
@@ -1555,7 +1559,10 @@ func handleHistorySync(e *events.HistorySync) {
 				"type": "thread", "id": thread, "name": name,
 				"snippet": lastText, "lastActivity": lastTs, "unread": false, "e2ee": true,
 			}
-			if !isGroup {
+			if isGroup {
+				thEv["ttype"] = int64(table.ENCRYPTED_OVER_WA_GROUP)
+			} else {
+				thEv["ttype"] = int64(table.ENCRYPTED_OVER_WA_ONE_TO_ONE)
 				thEv["contact"] = raw
 			}
 			emit(thEv)

@@ -707,6 +707,17 @@ func getMsgMeta(id string) (basicMsgMeta, bool) {
 	return m, ok
 }
 
+func isGroupThreadType(kind table.ThreadType) bool {
+	switch kind {
+	case table.GROUP_THREAD, table.ROOM, table.TINCAN_GROUP_DISAPPEARING, table.CARRIER_MESSAGING_GROUP,
+		table.ENCRYPTED_OVER_WA_GROUP, table.XAC_GROUP:
+		return true
+	default:
+		return (kind >= table.COMMUNITY_FOLDER && kind <= table.COMMUNITY_SUB_THREAD) ||
+			(kind >= table.DISCOVERABLE_PUBLIC_CHAT && kind <= table.DISCOVERABLE_PUBLIC_CHAT_V2_UNJOINED)
+	}
+}
+
 func recordThreadMetaLocked(key int64, tt table.ThreadType, sg int64, folder string) {
 	if key == 0 {
 		return
@@ -989,7 +1000,7 @@ func processTable(tbl *table.LSTable, live bool) {
 		}
 		metaMu.Lock()
 		id, jid, encrypted := resolveThreadLocked(rawKey)
-		isGrp := e2eeGroups[fmtID(jid)] || ttype == table.ENCRYPTED_OVER_WA_GROUP || ttype == table.GROUP_THREAD
+		isGrp := e2eeGroups[fmtID(jid)] || isGroupThreadType(ttype)
 		metaMu.Unlock()
 
 		noteThreadWatermark(id, readWm, lastAct)
@@ -1015,7 +1026,9 @@ func processTable(tbl *table.LSTable, live bool) {
 			"e2ee":         encrypted,
 		}
 		if encrypted {
-			if !isGrp {
+			if isGrp && !isGroupThreadType(ttype) {
+				ev["ttype"] = int64(table.ENCRYPTED_OVER_WA_GROUP)
+			} else if !isGrp {
 				ev["contact"] = fmtID(jid)
 			}
 			if rawPlain := fmtID(rawKey); rawPlain != id {
@@ -1055,7 +1068,14 @@ func processTable(tbl *table.LSTable, live bool) {
 			"lastActivity": hybrid.LastActivityTimestampMS, "readUpTo": hybrid.LastReadWatermarkTimestampMS,
 			"unread": hybrid.LastActivityTimestampMS > hybrid.LastReadWatermarkTimestampMS,
 		}
-		if !hybrid.IsGroupThread && hybrid.ThreadType != table.ENCRYPTED_OVER_WA_GROUP {
+		kind := hybrid.ThreadType
+		if hybrid.IsGroupThread && !isGroupThreadType(kind) {
+			kind = table.ENCRYPTED_OVER_WA_GROUP
+		}
+		if kind != 0 {
+			event["ttype"] = int64(kind)
+		}
+		if kind.IsOneToOne() {
 			event["contact"] = fmtID(hybrid.ThreadJID)
 		}
 		emit(event)
