@@ -77,12 +77,35 @@ pub fn palette(dark: bool) -> &'static Palette {
     if dark { &DARK } else { &LIGHT }
 }
 
-pub fn semibold(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("semibold".into()))
+pub fn text_scale(ui: &egui::Ui) -> f32 {
+    ui.ctx().data(|data| data.get_temp(egui::Id::new("text_scale")).unwrap_or(1.0))
 }
 
-pub fn body(size: f32) -> FontId {
-    FontId::proportional(size)
+pub fn semibold(ui: &egui::Ui, size: f32) -> FontId {
+    FontId::new(size * text_scale(ui), FontFamily::Name("semibold".into()))
+}
+
+pub fn body(ui: &egui::Ui, size: f32) -> FontId {
+    FontId::proportional(size * text_scale(ui))
+}
+
+pub fn set_text_scale(ctx: &egui::Context, scale: f32) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("text_scale"), scale));
+    ctx.style_mut(|style| {
+        style.text_styles = egui::Style::default().text_styles;
+        for font in style.text_styles.values_mut() {
+            font.size *= scale;
+        }
+    });
+}
+
+pub fn dialog(ctx: &egui::Context, id: &str, palette: &Palette) -> egui::Modal {
+    egui::Modal::new(egui::Id::new(id)).frame(
+        egui::Frame::popup(&ctx.style())
+            .fill(palette.sidebar)
+            .inner_margin(egui::Margin::same(20))
+            .corner_radius(egui::CornerRadius::same(14)),
+    )
 }
 
 pub fn apply(ctx: &egui::Context, dark: bool) {

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 const REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "😡"];
 const ROW_H: f32 = 62.0;
+const TEXT_SCALES: [u16; 9] = [80, 85, 90, 95, 100, 110, 120, 130, 140];
 
 #[derive(PartialEq)]
 enum Screen {
@@ -102,6 +103,11 @@ struct Viewer {
     offset: Vec2,
 }
 
+struct OutgoingFiles {
+    thread: String,
+    files: Vec<(PathBuf, bool)>,
+}
+
 pub struct App {
     ctx: egui::Context,
     store: Store,
@@ -119,8 +125,8 @@ pub struct App {
     tag: u64,
     last_toast: Instant,
     reconnect_at: Option<Instant>,
-    pick_tx: Sender<(String, PathBuf)>,
-    pick_rx: Receiver<(String, PathBuf)>,
+    pick_tx: Sender<(String, Vec<PathBuf>)>,
+    pick_rx: Receiver<(String, Vec<PathBuf>)>,
     image_copy_rx: Option<Receiver<Result<image::RgbaImage, String>>>,
     image_copy_feedback: Option<(&'static str, Instant)>,
     requested: HashSet<String>,
@@ -156,6 +162,7 @@ pub struct App {
     retry: u32,
     last_title: String,
     settings_open: bool,
+    text_scale: u16,
     cache_mb: u64,
     cache_used: u64,
     cache_checked: Instant,
@@ -175,7 +182,7 @@ pub struct App {
     search_hits: Vec<(String, String, f64)>,
     search_for: String,
     /// files waiting for "send?" confirmation: (path, temporary copy to delete afterwards)
-    outgoing: Vec<(PathBuf, bool)>,
+    outgoing: Option<OutgoingFiles>,
     #[cfg(windows)]
     paste_down: bool,
     tray: Option<tray_icon::TrayIcon>,
@@ -313,6 +320,60 @@ fn fit_text(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> String {
     chars[..lo].iter().collect::<String>() + "…"
 }
 
+fn chat_preview_text(snippet: &str) -> &str {
+    let line = snippet.lines().next().unwrap_or("");
+    let content = line.rsplit_once(": ").map_or(line, |(_, content)| content);
+    match content {
+        "📷 Photo" | "📷 Ảnh" => "Ảnh",
+        "🎬 Video" => "Video",
+        _ => line,
+    }
+}
+
+fn paint_chat_preview(ui: &egui::Ui, origin: egui::Pos2, snippet: &str, max_width: f32, color: Color32) {
+    use crate::emoji::Seg;
+
+    let text = chat_preview_text(snippet);
+    let font = theme::body(ui, 13.5);
+    let painter = ui.painter();
+    let measure = |text: &str| painter.layout_no_wrap(text.to_owned(), font.clone(), color).size().x;
+    let emoji_size = 14.0 * theme::text_scale(ui);
+    let runs: Vec<_> = crate::emoji::split(text).into_iter().map(|segment| {
+        let width = match segment {
+            Seg::Text(text) => measure(text),
+            Seg::Emoji(_) => emoji_size,
+        };
+        (segment, width)
+    }).collect();
+    let truncated = runs.iter().map(|(_, width)| width).sum::<f32>() > max_width;
+    let ellipsis_width = if truncated { measure("…") } else { 0.0 };
+    let mut offset = 0.0;
+    for (run, width) in runs {
+        let cursor = origin + Vec2::new(offset, 0.0);
+        if truncated && offset + width + ellipsis_width > max_width {
+            let last = match run {
+                Seg::Text(text) => fit_text(ui, &format!("{text}…"), &font, max_width - offset),
+                Seg::Emoji(_) => "…".to_owned(),
+            };
+            painter.text(cursor, Align2::LEFT_TOP, last, font, color);
+            break;
+        }
+        match run {
+            Seg::Text(text) => { painter.text(cursor, Align2::LEFT_TOP, text, font.clone(), color); }
+            Seg::Emoji(emoji) => {
+                let image_rect = egui::Rect::from_min_size(cursor + Vec2::new(0.0, 1.0), Vec2::splat(emoji_size));
+                let image = egui::Image::new(crate::emoji::uri(emoji)).fit_to_exact_size(image_rect.size());
+                match image.load_for_size(ui.ctx(), image_rect.size()) {
+                    Ok(egui::load::TexturePoll::Ready { texture }) => egui::Image::from_texture(texture).paint_at(ui, image_rect),
+                    Ok(egui::load::TexturePoll::Pending { .. }) => {}
+                    Err(_) => { painter.text(image_rect.center(), Align2::CENTER_CENTER, "•", font.clone(), color); }
+                }
+            }
+        }
+        offset += width;
+    }
+}
+
 /// Draw the first usable image, or a stable initials badge while pictures load.
 fn avatar<'a>(
     ui: &mut egui::Ui,
@@ -340,7 +401,7 @@ fn avatar<'a>(
     }
     ui.painter().circle_filled(rect.center(), size / 2.0, theme::avatar_color(key));
     let ch = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, ch, theme::semibold(size * 0.42), Color32::WHITE);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, ch, egui::FontId::new(size * 0.42, egui::FontFamily::Name("semibold".into())), Color32::WHITE);
     pending
 }
 
@@ -483,8 +544,8 @@ fn rail_badge(ui: &egui::Ui, rect: egui::Rect, n: usize, p: &Palette) {
         return;
     }
     let text = if n > 99 { "99+".to_string() } else { n.to_string() };
-    let g = ui.painter().layout_no_wrap(text, theme::semibold(10.0), Color32::WHITE);
-    let size = Vec2::new((g.size().x + 10.0).max(18.0), 17.0);
+    let g = ui.painter().layout_no_wrap(text, theme::semibold(ui, 10.0), Color32::WHITE);
+    let size = Vec2::new((g.size().x + 10.0).max(18.0), (g.size().y + 2.0).max(17.0));
     let r = egui::Rect::from_min_size(egui::pos2(rect.right() - size.x - 6.0, rect.top() + 3.0), size);
     ui.painter().rect_filled(r, CornerRadius::same(9), p.unread);
     ui.painter().galley(r.center() - g.size() / 2.0, g, Color32::WHITE);
@@ -492,7 +553,7 @@ fn rail_badge(ui: &egui::Ui, rect: egui::Rect, n: usize, p: &Palette) {
 
 /// Centered pill that hugs its text (date separators, system messages).
 fn chip(ui: &mut egui::Ui, text: &str, fill: Color32) {
-    let g = ui.painter().layout(text.to_string(), theme::body(12.0), Color32::WHITE, (ui.available_width() - 60.0).max(80.0));
+    let g = ui.painter().layout(text.to_string(), theme::body(ui, 12.0), Color32::WHITE, (ui.available_width() - 60.0).max(80.0));
     let size = g.size() + Vec2::new(20.0, 6.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), size.y), Sense::hover());
     let r = egui::Rect::from_center_size(rect.center(), size);
@@ -624,6 +685,13 @@ impl App {
         let db = Db::open().ok();
         let dark = db.as_ref().and_then(|d| d.get_setting("theme")).map(|t| t != "light").unwrap_or(true);
         theme::apply(&cc.egui_ctx, dark);
+        let text_scale = db
+            .as_ref()
+            .and_then(|d| d.get_setting("text_scale"))
+            .and_then(|value| value.parse().ok())
+            .filter(|value| TEXT_SCALES.contains(value))
+            .unwrap_or(100);
+        theme::set_text_scale(&cc.egui_ctx, f32::from(text_scale) / 100.0);
         let cache_mb: u64 = db.as_ref().and_then(|d| d.get_setting("cache_mb")).and_then(|v| v.parse().ok()).unwrap_or(1024);
         crate::cache::init(&cc.egui_ctx, cache_mb);
         let db_tray = db.as_ref().and_then(|d| d.get_setting("tray")).map(|v| v != "off").unwrap_or(true);
@@ -688,6 +756,7 @@ impl App {
             retry: 0,
             last_title: String::new(),
             settings_open: false,
+            text_scale,
             cache_mb,
             cache_used: 0,
             cache_checked: Instant::now(),
@@ -699,7 +768,7 @@ impl App {
             stuck_bottom: Default::default(),
             search_hits: Vec::new(),
             search_for: String::new(),
-            outgoing: Vec::new(),
+            outgoing: None,
             #[cfg(windows)]
             paste_down: false,
             tray: None,
@@ -1010,8 +1079,13 @@ impl App {
                 }
             }
         }
-        while let Ok((thread, path)) = self.pick_rx.try_recv() {
-            self.send_cmd(json!({"cmd": "sendMedia", "thread": thread, "path": path.to_string_lossy(), "caption": ""}));
+        while let Ok((thread, paths)) = self.pick_rx.try_recv() {
+            if self.screen == Screen::Main && self.outgoing.is_none() {
+                self.outgoing = Some(OutgoingFiles {
+                    thread,
+                    files: paths.into_iter().map(|path| (path, false)).collect(),
+                });
+            }
         }
     }
 
@@ -1330,8 +1404,8 @@ impl App {
                     let tx = self.pick_tx.clone();
                     let ctx = self.ctx.clone();
                     std::thread::spawn(move || {
-                        if let Some(p) = rfd::FileDialog::new().set_title("Chọn tệp để gửi").pick_file() {
-                            let _ = tx.send((th, p));
+                        if let Some(paths) = rfd::FileDialog::new().set_title("Chọn tệp để gửi").pick_files() {
+                            let _ = tx.send((th, paths));
                             ctx.request_repaint();
                         }
                     });
@@ -1566,7 +1640,7 @@ impl App {
     }
 
     /// A picture on the clipboard (and no text) becomes a file waiting for "send?".
-    fn paste_clipboard_image(&mut self) {
+    fn paste_clipboard_image(&mut self, thread: String) {
         let Ok(mut cb) = arboard::Clipboard::new() else { return };
         if cb.get_text().map(|t| !t.is_empty()).unwrap_or(false) {
             return; // text paste is handled by the text box
@@ -1575,46 +1649,69 @@ impl App {
         let Some(rgba) = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned()) else { return };
         let path = std::env::temp_dir().join(format!("russenger-paste-{}.png", now_ms()));
         if rgba.save(&path).is_ok() {
-            self.outgoing.push((path, true));
+            self.outgoing = Some(OutgoingFiles { thread, files: vec![(path, true)] });
         }
     }
 
     fn draw_outgoing(&mut self, ctx: &egui::Context) {
-        let (mut send, mut cancel) = (false, false);
-        egui::Window::new("Gửi tệp").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            for (path, _) in &self.outgoing {
-                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-                if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
-                    ui.add(egui::Image::new(format!("file://{}", path.to_string_lossy().replace('\\', "/"))).max_size(Vec2::new(340.0, 240.0)).corner_radius(CornerRadius::same(8)));
-                }
-                ui.label(name);
+        let Some(outgoing) = &self.outgoing else { return };
+        let p = theme::palette(self.dark);
+        let recipient = self.store.threads.get(&outgoing.thread).map(|thread| self.store.display_name(thread));
+        let count = outgoing.files.len();
+        let mut cancel = false;
+        let dialog = theme::dialog(ctx, "send_files", p).show(ctx, |ui| {
+            ui.set_width(420.0_f32.min(ctx.screen_rect().width() - 64.0));
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.label(RichText::new("Gửi tệp đính kèm").font(theme::semibold(ui, 20.0)));
+            if let Some(name) = &recipient {
+                ui.label(RichText::new(format!("Gửi đến {name}")).color(p.secondary));
             }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Gửi").clicked() {
-                    send = true;
-                }
-                if ui.button("Hủy").clicked() {
-                    cancel = true;
-                }
-            });
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, true])
+                .max_height((ctx.screen_rect().height() - 245.0).max(72.0))
+                .show(ui, |ui| {
+                    for (path, _) in &outgoing.files {
+                        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                        egui::Frame::new().fill(p.input).corner_radius(10).inner_margin(Margin::same(10)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new(name).strong());
+                            if let Ok(meta) = path.metadata() {
+                                ui.label(RichText::new(fmt_bytes(meta.len())).color(p.secondary));
+                            }
+                            let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default().to_ascii_lowercase();
+                            if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+                                ui.add(egui::Image::new(format!("file://{}", path.to_string_lossy().replace('\\', "/")))
+                                    .max_size(Vec2::new(ui.available_width(), 220.0))
+                                    .corner_radius(CornerRadius::same(8)));
+                            }
+                        });
+                    }
+                });
+            ui.separator();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let send = egui::Button::new(RichText::new(format!("Gửi {count} tệp")).strong().color(Color32::WHITE))
+                    .fill(p.bubble_out).corner_radius(8).min_size(Vec2::new(118.0, 42.0));
+                let send = ui.add_enabled(recipient.is_some(), send).clicked();
+                cancel = ui.add_sized([88.0, 42.0], egui::Button::new("Hủy").corner_radius(8)).clicked();
+                send
+            }).inner
         });
-        if !(send || cancel) {
+        let send = dialog.inner;
+        let escape = dialog.is_top_modal && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if !(send || cancel || escape) {
             return;
         }
-        let files = std::mem::take(&mut self.outgoing);
-        let th = self.selected.clone();
-        for (path, temp) in files {
+        let Some(outgoing) = self.outgoing.take() else { return };
+        for (path, temp) in outgoing.files {
             if send {
-                if let Some(th) = &th {
-                    self.send_cmd(json!({"cmd": "sendMedia", "thread": th, "path": path.to_string_lossy(), "caption": ""}));
-                }
+                self.send_cmd(json!({"cmd": "sendMedia", "thread": outgoing.thread, "path": path.to_string_lossy(), "caption": ""}));
             }
             if temp {
-                // the helper reads the file while sending; give it time before removing the copy
+                // The helper reads the file while sending.
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(if send { 180 } else { 0 }));
+                    if send {
+                        std::thread::sleep(Duration::from_secs(180));
+                    }
                     let _ = std::fs::remove_file(path);
                 });
             }
@@ -1628,50 +1725,82 @@ impl App {
             self.cache_checked = Instant::now();
         }
         ctx.request_repaint_after(Duration::from_secs(2));
-        let mut open = true;
-        let mut limit_changed = false;
-        egui::Window::new("Cài đặt").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.label(RichText::new("Bộ nhớ đệm ảnh và video").font(theme::semibold(14.5)));
-            ui.label(
-                RichText::new("Ảnh và video đã xem được giữ lại trên máy đến mức này; vượt mức thì xóa cái cũ nhất. Cần lại sẽ tải từ Facebook (riêng chat mã hóa đầu cuối thì không tải lại được).")
-                    .size(12.0)
-                    .color(p.secondary),
-            );
-            ui.add_space(4.0);
-            ui.label(format!("Đang dùng: {}", fmt_bytes(self.cache_used)));
-            ui.horizontal(|ui| {
-                ui.label("Giới hạn:");
-                egui::ComboBox::from_id_salt("cache_limit").selected_text(fmt_bytes(self.cache_mb << 20)).show_ui(ui, |ui| {
-                    for mb in [256u64, 512, 1024, 2048, 5120, 10240, 20480] {
-                        if ui.selectable_value(&mut self.cache_mb, mb, fmt_bytes(mb << 20)).clicked() {
-                            limit_changed = true;
+        let old_scale = self.text_scale;
+        let old_limit = self.cache_mb;
+        let dialog = theme::dialog(ctx, "settings", p).show(ctx, |ui| {
+            ui.set_width(440.0_f32.min(ctx.screen_rect().width() - 64.0));
+            ui.spacing_mut().interact_size.y = 38.0;
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(RichText::new("Cài đặt").font(theme::semibold(ui, 20.0)));
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, true])
+                .max_height((ctx.screen_rect().height() - 175.0).max(100.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Giao diện").font(theme::semibold(ui, 15.0)));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Cỡ chữ");
+                        egui::ComboBox::from_id_salt("text_scale").width(100.0)
+                            .selected_text(format!("{}%", self.text_scale))
+                            .show_ui(ui, |ui| {
+                                for scale in TEXT_SCALES {
+                                    ui.selectable_value(&mut self.text_scale, scale, format!("{scale}%"));
+                                }
+                            });
+                        if ui.add_enabled(self.text_scale != 100, egui::Button::new("Mặc định")).clicked() {
+                            self.text_scale = 100;
+                        }
+                    });
+                    ui.separator();
+                    ui.label(RichText::new("Bộ nhớ đệm").font(theme::semibold(ui, 15.0)));
+                    ui.label(RichText::new(format!("Ảnh và video đang dùng {}", fmt_bytes(self.cache_used))).color(p.secondary));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Giới hạn");
+                        egui::ComboBox::from_id_salt("cache_limit").width(100.0)
+                            .selected_text(fmt_bytes(self.cache_mb << 20))
+                            .show_ui(ui, |ui| {
+                                for mb in [256u64, 512, 1024, 2048, 5120, 10240, 20480] {
+                                    ui.selectable_value(&mut self.cache_mb, mb, fmt_bytes(mb << 20));
+                                }
+                            });
+                        if ui.button("Xóa bộ nhớ đệm").clicked() {
+                            cache::clear();
+                            self.cache_used = cache::usage();
+                        }
+                    });
+                    ui.label(RichText::new("Ảnh và video trong chat mã hóa có thể không tải lại được sau khi xóa bộ nhớ đệm.").color(p.secondary));
+                    ui.separator();
+                    ui.label(RichText::new("Khởi động và chạy nền").font(theme::semibold(ui, 15.0)));
+                    if ui.checkbox(&mut self.autostart, if cfg!(windows) { "Khởi động cùng Windows" } else { "Mở khi đăng nhập macOS" }).changed() {
+                        notify::set_autostart(self.autostart);
+                    }
+                    if ui.checkbox(&mut self.tray_on, "Tiếp tục chạy nền khi đóng cửa sổ").changed() {
+                        if let Some(db) = &self.store.db {
+                            db.set_setting("tray", if self.tray_on { "on" } else { "off" });
                         }
                     }
                 });
-                if ui.button("Xóa bộ nhớ đệm").clicked() {
-                    cache::clear();
-                    self.cache_used = cache::usage();
-                }
-            });
             ui.separator();
-            if ui.checkbox(&mut self.autostart, if cfg!(windows) { "Khởi động cùng Windows (chạy ẩn ở khay hệ thống)" } else { "Mở khi đăng nhập macOS" }).changed() {
-                notify::set_autostart(self.autostart);
-            }
-            if ui.checkbox(&mut self.tray_on, "Đóng cửa sổ thì chạy nền ở khay hệ thống").changed() {
-                if let Some(db) = &self.store.db {
-                    db.set_setting("tray", if self.tray_on { "on" } else { "off" });
-                }
-            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add(egui::Button::new(RichText::new("Xong").strong().color(Color32::WHITE))
+                    .fill(p.bubble_out).corner_radius(8).min_size(Vec2::new(96.0, 42.0))).clicked()
+            }).inner
         });
-        if limit_changed {
+        if old_scale != self.text_scale {
+            theme::set_text_scale(ctx, f32::from(self.text_scale) / 100.0);
+            self.row_heights.clear();
+            if let Some(db) = &self.store.db {
+                db.set_setting("text_scale", &self.text_scale.to_string());
+            }
+            ctx.request_repaint();
+        }
+        if old_limit != self.cache_mb {
             cache::set_limit_mb(self.cache_mb);
             if let Some(db) = &self.store.db {
                 db.set_setting("cache_mb", &self.cache_mb.to_string());
             }
             std::thread::spawn(cache::trim);
         }
-        if !open {
+        if dialog.inner || dialog.should_close() {
             self.settings_open = false;
         }
     }
@@ -1686,11 +1815,11 @@ impl App {
                     ui.vertical_centered(|ui| {
                         ui.add(egui::Image::from_bytes("bytes://russenger-icon.png", include_bytes!("../../assets/icon-512.png").as_slice()).fit_to_exact_size(Vec2::splat(84.0)));
                         ui.add_space(10.0);
-                        ui.label(RichText::new("Russenger").font(theme::semibold(26.0)).color(p.text));
-                        ui.label(RichText::new(if cfg!(windows) { "Messenger gốc, chạy native trên Windows" } else { "Messenger cho macOS" }).color(p.secondary).size(13.0));
+                        ui.label(RichText::new("Russenger").font(theme::semibold(ui, 26.0)).color(p.text));
+                        ui.label(RichText::new(if cfg!(windows) { "Messenger gốc, chạy native trên Windows" } else { "Messenger cho macOS" }).color(p.secondary).font(theme::body(ui, 13.0)));
                         ui.add_space(18.0);
                         let waiting = self.login_rx.is_some();
-                        let btn = egui::Button::new(RichText::new("Đăng nhập bằng Facebook").font(theme::semibold(15.0)).color(Color32::WHITE))
+                        let btn = egui::Button::new(RichText::new("Đăng nhập bằng Facebook").font(theme::semibold(ui, 15.0)).color(Color32::WHITE))
                             .fill(p.accent)
                             .corner_radius(CornerRadius::same(10))
                             .min_size(Vec2::new(340.0, 42.0));
@@ -1699,10 +1828,10 @@ impl App {
                         }
                         if !self.login_status.is_empty() {
                             ui.add_space(8.0);
-                            ui.label(RichText::new(&self.login_status).color(p.secondary).size(12.5));
+                            ui.label(RichText::new(&self.login_status).color(p.secondary).font(theme::body(ui, 12.5)));
                         }
                         ui.add_space(8.0);
-                        egui::CollapsingHeader::new(RichText::new("Nâng cao: dán cookie").color(p.secondary).size(12.5)).show(ui, |ui| {
+                        egui::CollapsingHeader::new(RichText::new("Nâng cao: dán cookie").color(p.secondary).font(theme::body(ui, 12.5))).show(ui, |ui| {
                             ui.add(egui::TextEdit::multiline(&mut self.paste).desired_rows(3).desired_width(330.0).password(true).hint_text("datr=…; c_user=…; xs=…"));
                             if ui.add_enabled(!self.paste.trim().is_empty(), egui::Button::new("Dùng cookie này")).clicked() {
                                 let c = self.paste.trim().to_string();
@@ -1710,7 +1839,7 @@ impl App {
                             }
                         });
                         ui.add_space(12.0);
-                        ui.label(RichText::new("Client không chính thức (giao thức dịch ngược). Tài khoản có thể bị Meta giới hạn.").size(11.0).color(p.secondary));
+                        ui.label(RichText::new("Client không chính thức (giao thức dịch ngược). Tài khoản có thể bị Meta giới hạn.").font(theme::body(ui, 11.0)).color(p.secondary));
                     });
                 });
             });
@@ -1778,7 +1907,7 @@ impl App {
                     let col = if selected { p.accent } else { p.secondary };
                     let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 23.0), Vec2::splat(22.0));
                     icons::paint(ui.painter(), icon, icon_rect, col);
-                    ui.painter().text(egui::pos2(rect.center().x, rect.top() + 45.0), Align2::CENTER_CENTER, label, if selected { theme::semibold(11.0) } else { theme::body(11.0) }, col);
+                    ui.painter().text(egui::pos2(rect.center().x, rect.top() + 45.0), Align2::CENTER_CENTER, label, if selected { theme::semibold(ui, 11.0) } else { theme::body(ui, 11.0) }, col);
                     rail_badge(ui, rect, unread.get(&tab).copied().unwrap_or(0), p);
                     if resp.clicked() {
                         picked = Some(tab);
@@ -1797,8 +1926,8 @@ impl App {
                         let av = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 25.0), Vec2::splat(34.0));
                         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(av));
                         avatar(&mut child, if c.picture.is_empty() { None } else { Some(c.picture.as_str()) }, &c.name, id, 34.0);
-                        let short = fit_text(ui, &c.name, &theme::body(10.5), rect.width() - 8.0);
-                        ui.painter().text(egui::pos2(rect.center().x, rect.top() + 51.0), Align2::CENTER_CENTER, short, theme::body(10.5), if selected { p.accent } else { p.secondary });
+                        let short = fit_text(ui, &c.name, &theme::body(ui, 10.5), rect.width() - 8.0);
+                        ui.painter().text(egui::pos2(rect.center().x, rect.top() + 51.0), Align2::CENTER_CENTER, short, theme::body(ui, 10.5), if selected { p.accent } else { p.secondary });
                         rail_badge(ui, rect, unread.get(&tab).copied().unwrap_or(0), p);
                         resp.clone().on_hover_text(&c.name);
                         if resp.clicked() {
@@ -1839,12 +1968,13 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     ui.menu_button(RichText::new("☰").size(18.0).color(p.secondary), |ui| {
+                        ui.spacing_mut().interact_size.y = 34.0;
                         let label = if self.dark { "☀ Giao diện sáng" } else { "🌙 Giao diện tối" };
                         if ui.button(label).clicked() {
                             actions.push(Action::ToggleTheme);
                             ui.close_menu();
                         }
-                        if ui.button("⚙ Cài đặt").clicked() {
+                        if ui.button("Cài đặt").clicked() {
                             actions.push(Action::Settings);
                             ui.close_menu();
                         }
@@ -1876,10 +2006,10 @@ impl App {
                     if self.tab == Tab::Chats {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let draw_chip = |ui: &mut egui::Ui, label: &str, active: bool| -> bool {
-                            let font = if active { theme::semibold(12.5) } else { theme::body(12.5) };
+                            let font = if active { theme::semibold(ui, 12.5) } else { theme::body(ui, 12.5) };
                             let fg = if active { Color32::WHITE } else { p.secondary };
                             let g = ui.painter().layout_no_wrap(label.to_string(), font, fg);
-                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 20.0, 24.0), Sense::click());
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 20.0, (g.size().y + 6.0).max(24.0)), Sense::click());
                             if resp.hovered() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
@@ -1909,7 +2039,7 @@ impl App {
                         }
                     } else {
                         // truncated: a long community name must not force the panel wider than the user set
-                        ui.add(egui::Label::new(RichText::new(self.tab_title()).font(theme::semibold(13.5)).color(p.secondary)).truncate());
+                        ui.add(egui::Label::new(RichText::new(self.tab_title()).font(theme::semibold(ui, 13.5)).color(p.secondary)).truncate());
                     }
                 });
                 ui.add_space(4.0);
@@ -1927,7 +2057,9 @@ impl App {
                     .collect();
                 list.sort_by(|a, b| b.last_activity.total_cmp(&a.last_activity));
 
-                let footer_h = 24.0;
+                let text_spacing = theme::text_scale(ui).max(1.0);
+                let row_height = ROW_H * text_spacing;
+                let footer_h = 24.0 * text_spacing;
                 let area_h = (ui.available_height() - footer_h).max(60.0);
                 // message search: needs two letters; results are listed under the chats
                 let q_raw = self.search.trim().to_string();
@@ -1947,15 +2079,15 @@ impl App {
                         egui::pos2(rect.center().x, rect.top() + 48.0),
                         Align2::CENTER_CENTER,
                         "Không có cuộc trò chuyện chưa đọc",
-                        theme::body(13.0),
+                        theme::body(ui, 13.0),
                         p.secondary,
                     );
                 } else {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).drag_to_scroll(false).max_height((area_h - hits_h).max(60.0)).show_rows(ui, ROW_H, list.len(), |ui, range| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).drag_to_scroll(false).max_height((area_h - hits_h).max(60.0)).show_rows(ui, row_height, list.len(), |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for t in &list[range] {
                         let selected = self.selected.as_deref() == Some(&t.id);
-                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), Sense::click());
                         let hover_t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                         let fill = if selected { p.row_selected } else { p.row_hover.gamma_multiply(hover_t) };
                         // Telegram-style full-bleed row background edge-to-edge up to the divider
@@ -1970,22 +2102,21 @@ impl App {
                         let tx = av.right() + 10.0;
                         let right = rect.right() - 13.0;
                         let time = list_time(t.last_activity);
-                        let time_g = ui.painter().layout_no_wrap(time, theme::body(12.0), if selected { sub } else { p.secondary });
+                        let time_g = ui.painter().layout_no_wrap(time, theme::body(ui, 12.0), if selected { sub } else { p.secondary });
                         let time_w = time_g.size().x;
                         let name_w = (right - tx - time_w - 8.0).max(30.0);
-                        let name_fit = fit_text(ui, &name, &theme::semibold(14.5), name_w);
-                        ui.painter().text(egui::pos2(tx, rect.top() + 10.0), Align2::LEFT_TOP, name_fit, theme::semibold(14.5), fg);
+                        let name_fit = fit_text(ui, &name, &theme::semibold(ui, 14.5), name_w);
+                        ui.painter().text(egui::pos2(tx, rect.top() + 10.0), Align2::LEFT_TOP, name_fit, theme::semibold(ui, 14.5), fg);
                         ui.painter().galley(egui::pos2(right - time_w, rect.top() + 12.0), time_g, Color32::PLACEHOLDER);
 
                         let badge_w = if t.unread || t.muted { 22.0 } else { 0.0 };
                         let sn_w = (right - tx - badge_w).max(30.0);
-                        let sn_fit = fit_text(ui, &t.snippet, &theme::body(13.5), sn_w);
-                        ui.painter().text(egui::pos2(tx, rect.top() + 33.0), Align2::LEFT_TOP, sn_fit, theme::body(13.5), sub);
+                        paint_chat_preview(ui, egui::pos2(tx, rect.top() + 33.0 * text_spacing), &t.snippet, sn_w, sub);
                         if t.unread {
                             let col = if selected { Color32::WHITE } else if t.muted { p.unread_muted } else { p.unread };
-                            ui.painter().circle_filled(egui::pos2(right - 5.0, rect.top() + 42.0), 5.0, col);
+                            ui.painter().circle_filled(egui::pos2(right - 5.0, rect.top() + 42.0 * text_spacing), 5.0, col);
                         } else if t.muted {
-                            let mark = egui::Rect::from_center_size(egui::pos2(right - 7.0, rect.top() + 42.0), Vec2::splat(13.0));
+                            let mark = egui::Rect::from_center_size(egui::pos2(right - 7.0, rect.top() + 42.0 * text_spacing), Vec2::splat(13.0));
                             icons::paint(ui.painter(), Icon::Muted, mark, sub);
                         }
 
@@ -2009,24 +2140,24 @@ impl App {
                 if !self.search_hits.is_empty() {
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
-                        ui.label(RichText::new("Tin nhắn").font(theme::semibold(13.5)).color(p.secondary));
+                        ui.label(RichText::new("Tin nhắn").font(theme::semibold(ui, 13.5)).color(p.secondary));
                     });
                     egui::ScrollArea::vertical().id_salt("search_hits").auto_shrink([false, false]).max_height((hits_h - 26.0).max(40.0)).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for (th, text, ts) in &self.search_hits {
                             let name = self.store.threads.get(th).map(|t| self.store.display_name(t)).unwrap_or_default();
-                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0), Sense::click());
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0 * text_spacing), Sense::click());
                             if resp.hovered() {
                                 ui.painter().rect_filled(rect, CornerRadius::ZERO, p.row_hover);
                             }
                             let (tx, right) = (rect.left() + 12.0, rect.right() - 13.0);
-                            let time_g = ui.painter().layout_no_wrap(list_time(*ts), theme::body(12.0), p.secondary);
+                            let time_g = ui.painter().layout_no_wrap(list_time(*ts), theme::body(ui, 12.0), p.secondary);
                             let time_w = time_g.size().x;
                             ui.painter().galley(egui::pos2(right - time_w, rect.top() + 10.0), time_g, Color32::PLACEHOLDER);
-                            let name_fit = fit_text(ui, &name, &theme::semibold(14.0), (right - tx - time_w - 8.0).max(30.0));
-                            ui.painter().text(egui::pos2(tx, rect.top() + 8.0), Align2::LEFT_TOP, name_fit, theme::semibold(14.0), p.text);
-                            let snip = fit_text(ui, &around(text, &self.search_for), &theme::body(13.0), (right - tx).max(30.0));
-                            ui.painter().text(egui::pos2(tx, rect.top() + 28.0), Align2::LEFT_TOP, snip, theme::body(13.0), p.secondary);
+                            let name_fit = fit_text(ui, &name, &theme::semibold(ui, 14.0), (right - tx - time_w - 8.0).max(30.0));
+                            ui.painter().text(egui::pos2(tx, rect.top() + 8.0), Align2::LEFT_TOP, name_fit, theme::semibold(ui, 14.0), p.text);
+                            let snip = fit_text(ui, &around(text, &self.search_for), &theme::body(ui, 13.0), (right - tx).max(30.0));
+                            ui.painter().text(egui::pos2(tx, rect.top() + 28.0 * text_spacing), Align2::LEFT_TOP, snip, theme::body(ui, 13.0), p.secondary);
                             if resp.clicked() {
                                 actions.push(Action::Select(th.clone()));
                             }
@@ -2035,7 +2166,7 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
-                    ui.label(RichText::new(self.status_text()).size(11.5).color(p.secondary));
+                    ui.label(RichText::new(self.status_text()).font(theme::body(ui, 11.5)).color(p.secondary));
                     if self.store.ready && self.search.trim().is_empty() && ui.small_button("⟳ Chat cũ hơn").on_hover_text("Tải thêm các cuộc trò chuyện cũ hơn").clicked() {
                         actions.push(Action::MoreThreads);
                     }
@@ -2077,14 +2208,14 @@ impl App {
 
     fn draw_pin_card(&mut self, ui: &mut egui::Ui, p: &'static Palette, actions: &mut Vec<Action>) {
         egui::Frame::new().fill(p.sidebar).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(12)).show(ui, |ui| {
-            ui.label(RichText::new("Khôi phục lịch sử chat mã hóa").font(theme::semibold(14.5)).color(p.text));
-            ui.label(RichText::new("Nhập mã PIN 6 số của Messenger (Lưu trữ an toàn). PIN chỉ gửi đi để khôi phục, không được lưu lại.").size(12.0).color(p.secondary));
+            ui.label(RichText::new("Khôi phục lịch sử chat mã hóa").font(theme::semibold(ui, 14.5)).color(p.text));
+            ui.label(RichText::new("Nhập mã PIN 6 số của Messenger (Lưu trữ an toàn). PIN chỉ gửi đi để khôi phục, không được lưu lại.").font(theme::body(ui, 12.0)).color(p.secondary));
             if let Some(e) = &self.store.history_error {
                 let mut t = e.clone();
                 if let Some(n) = self.store.history_attempts {
                     t.push_str(&format!(" · còn {n} lần thử"));
                 }
-                ui.label(RichText::new(t).size(12.0).color(p.danger));
+                ui.label(RichText::new(t).font(theme::body(ui, 12.0)).color(p.danger));
             }
             ui.horizontal(|ui| {
                 let r = ui.add(egui::TextEdit::singleline(&mut self.pin).password(true).desired_width(110.0).hint_text("6 chữ số"));
@@ -2126,7 +2257,7 @@ impl App {
             let Some(th_id) = self.selected.clone() else {
                 ui.centered_and_justified(|ui| {
                     egui::Frame::new().fill(p.chip).corner_radius(CornerRadius::same(14)).inner_margin(Margin::symmetric(14, 6)).show(ui, |ui| {
-                        ui.label(RichText::new("Chọn một cuộc trò chuyện để bắt đầu").size(14.0).color(Color32::WHITE));
+                        ui.label(RichText::new("Chọn một cuộc trò chuyện để bắt đầu").font(theme::body(ui, 14.0)).color(Color32::WHITE));
                     });
                 });
                 return;
@@ -2138,7 +2269,7 @@ impl App {
 
             // ----- header -----
             egui::TopBottomPanel::top("chat_header")
-                .exact_height(56.0)
+                .exact_height(56.0 * theme::text_scale(ui).max(1.0))
                 .frame(egui::Frame::new().fill(p.sidebar).inner_margin(Margin::symmetric(14, 0)))
                 .show_inside(ui, |ui| {
                     ui.horizontal_centered(|ui| {
@@ -2146,19 +2277,19 @@ impl App {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add_space(8.0);
-                            ui.label(RichText::new(&name).font(theme::semibold(15.0)).color(p.text));
+                            ui.label(RichText::new(&name).font(theme::semibold(ui, 15.0)).color(p.text));
                             if self.store.typing.get(&th_id).copied().unwrap_or(false) {
-                                ui.label(RichText::new("đang nhập…").size(12.5).color(p.accent));
+                                ui.label(RichText::new("đang nhập…").font(theme::body(ui, 12.5)).color(p.accent));
                             } else if self.store.presence.get(&key).copied().unwrap_or(false) {
-                                ui.label(RichText::new("đang hoạt động").size(12.5).color(p.accent));
+                                ui.label(RichText::new("đang hoạt động").font(theme::body(ui, 12.5)).color(p.accent));
                             } else if is_e2ee {
                                 ui.horizontal(|ui| {
                                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
                                     icons::paint(ui.painter(), Icon::Lock, rect, p.secondary);
-                                    ui.label(RichText::new("mã hóa đầu cuối").size(12.5).color(p.secondary));
+                                    ui.label(RichText::new("mã hóa đầu cuối").font(theme::body(ui, 12.5)).color(p.secondary));
                                 });
                             } else if thread.is_group() {
-                                ui.label(RichText::new("nhóm").size(12.5).color(p.secondary));
+                                ui.label(RichText::new("nhóm").font(theme::body(ui, 12.5)).color(p.secondary));
                             }
                         });
                         // calls run in Facebook's web client (see russenger-call)
@@ -2183,7 +2314,7 @@ impl App {
                                     _ if self.open_history_cursor(&th_id).is_some() => "Tải tiếp lịch sử",
                                     _ => "Đồng bộ 7 ngày",
                                 };
-                                let button = egui::Button::new(RichText::new(label).size(12.0).color(p.secondary)).frame(false);
+                                let button = egui::Button::new(RichText::new(label).font(theme::body(ui, 12.0)).color(p.secondary)).frame(false);
                                 if ui.add_enabled(self.store.ready && state != Some("running") && !self.older_loading.contains(&th_id), button)
                                     .on_hover_text("Tải lại tin nhắn trong 7 ngày gần nhất").clicked()
                                 {
@@ -2207,8 +2338,17 @@ impl App {
                     } else if self.editing.is_some() {
                         self.compose_bar(ui, p, "Sửa tin nhắn", &self.input.clone().chars().take(90).collect::<String>(), &mut actions);
                     }
-                    ui.horizontal(|ui| {
-                        if icons::button(ui, Icon::Attachment, true, 18.0, p.secondary, "Gửi ảnh/tệp").clicked() {
+                    let height_id = ui.id().with("composer_row_height");
+                    let row_height = ui.data(|data| data.get_temp::<f32>(height_id)).unwrap_or(38.0);
+                    let row_size = Vec2::new(ui.available_width(), row_height);
+                    ui.allocate_ui_with_layout(row_size, Layout::left_to_right(Align::Center), |ui| {
+                        let attach = if ui.available_width() >= 360.0 {
+                            let button = egui::Button::new("Đính kèm").corner_radius(8).min_size(Vec2::new(82.0, 38.0));
+                            ui.add(button).on_hover_text("Chọn ảnh hoặc tệp để gửi")
+                        } else {
+                            icons::button(ui, Icon::Attachment, true, 28.0, p.secondary, "Đính kèm ảnh hoặc tệp")
+                        };
+                        if attach.clicked() {
                             actions.push(Action::Attach);
                         }
                         // emoji picker (colour pictures; clicking one appends it to the message)
@@ -2248,7 +2388,7 @@ impl App {
                             }
                         }
                         // stickers seen in chats can be sent again (regular chats only)
-                        let sb = ui.add(egui::Button::new(RichText::new("Sticker").size(12.5).color(p.secondary)).frame(false)).on_hover_text("Sticker gần đây");
+                        let sb = ui.add(egui::Button::new(RichText::new("Sticker").font(theme::body(ui, 12.5)).color(p.secondary)).frame(false)).on_hover_text("Sticker gần đây");
                         if sb.clicked() {
                             self.sticker_open = !self.sticker_open;
                             self.emoji_open = false;
@@ -2266,9 +2406,9 @@ impl App {
                                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                                         ui.set_width(360.0);
                                         if is_e2ee {
-                                            ui.label(RichText::new("Chưa gửi được sticker trong chat mã hóa đầu cuối.").size(12.5).color(p.secondary));
+                                            ui.label(RichText::new("Chưa gửi được sticker trong chat mã hóa đầu cuối.").font(theme::body(ui, 12.5)).color(p.secondary));
                                         } else if self.store.stickers.is_empty() {
-                                            ui.label(RichText::new("Chưa có sticker nào. Sticker bạn nhận được trong các cuộc trò chuyện sẽ hiện ở đây để gửi lại.").size(12.5).color(p.secondary));
+                                            ui.label(RichText::new("Chưa có sticker nào. Sticker bạn nhận được trong các cuộc trò chuyện sẽ hiện ở đây để gửi lại.").font(theme::body(ui, 12.5)).color(p.secondary));
                                         } else {
                                             egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                                                 ui.horizontal_wrapped(|ui| {
@@ -2368,7 +2508,7 @@ impl App {
                         // completes the tag instead of prematurely sending the half-typed message!
                         let mut picked_mention: Option<MentionCandidate> = None;
                         let mut nav_scrolled = false;
-                        let composer_focused = ui.memory(|m| m.has_focus(id));
+                        let composer_focused = !self.settings_open && self.outgoing.is_none() && ui.memory(|m| m.has_focus(id));
                         if composer_focused && !candidates.is_empty() {
                             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
                                 self.mention_idx = (self.mention_idx + 1) % candidates.len();
@@ -2417,6 +2557,12 @@ impl App {
                             });
                         });
 
+                        let next_height = pill_frame.response.rect.height().max(38.0);
+                        if (next_height - row_height).abs() > 0.25 {
+                            ui.data_mut(|data| data.insert_temp(height_id, next_height));
+                            ui.ctx().request_repaint();
+                        }
+
                         // Right-click anywhere inside the composer pill opens the text edit context menu.
                         if ui.ctx().input(|i| i.pointer.secondary_clicked()) {
                             if let Some(pt) = ui.ctx().pointer_interact_pos() {
@@ -2464,7 +2610,7 @@ impl App {
                                 self.composer_menu = None;
                             } else {
                                 let screen = ui.ctx().screen_rect();
-                                let menu_w = 188.0;
+                                let menu_w = 188.0 * theme::text_scale(ui).max(1.0);
                                 let pos = egui::pos2(
                                     anchor.x.clamp(screen.left() + 8.0, (screen.right() - menu_w - 8.0).max(8.0)),
                                     (anchor.y - 4.0).max(screen.top() + 170.0),
@@ -2516,7 +2662,7 @@ impl App {
                                                         egui::pos2(r_item.left() + 12.0, r_item.center().y),
                                                         Align2::LEFT_CENTER,
                                                         label,
-                                                        theme::body(13.0),
+                                                        theme::body(ui, 13.0),
                                                         fg,
                                                     );
                                                     if !shortcut.is_empty() {
@@ -2524,7 +2670,7 @@ impl App {
                                                             egui::pos2(r_item.right() - 12.0, r_item.center().y),
                                                             Align2::RIGHT_CENTER,
                                                             shortcut,
-                                                            theme::body(11.5),
+                                                            theme::body(ui, 11.5),
                                                             sc_col,
                                                         );
                                                     }
@@ -2581,7 +2727,7 @@ impl App {
                                                 self.input.replace_range(b_min..b_max, &clean);
                                                 new_range = Some(egui::text::CCursorRange::one(egui::text::CCursor::new(c_min + added)));
                                             } else {
-                                                self.paste_clipboard_image();
+                                                self.paste_clipboard_image(th_id.clone());
                                             }
                                         }
                                         EditMenuOp::SelectAll => {
@@ -2639,9 +2785,10 @@ impl App {
                                             ui.set_width(popup_w);
                                             egui::ScrollArea::vertical().id_salt("mention_scroll").max_height(228.0).auto_shrink([false, true]).show(ui, |ui| {
                                                 ui.spacing_mut().item_spacing.y = 0.0;
+                                                let text_spacing = theme::text_scale(ui).max(1.0);
                                                 for (idx, cand) in candidates.iter().enumerate() {
                                                     let is_sel = idx == self.mention_idx;
-                                                    let (row_r, row_resp) = ui.allocate_exact_size(Vec2::new(popup_w, 38.0), Sense::click());
+                                                    let (row_r, row_resp) = ui.allocate_exact_size(Vec2::new(popup_w, 38.0 * text_spacing), Sense::click());
                                                     if row_resp.hovered() {
                                                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                                         if pointer_moved {
@@ -2664,7 +2811,7 @@ impl App {
                                                     );
                                                     if cand.is_everyone {
                                                         ui.painter().circle_filled(av_r.center(), 14.0, p.accent);
-                                                        ui.painter().text(av_r.center(), Align2::CENTER_CENTER, "@", theme::semibold(14.0), Color32::WHITE);
+                                                        ui.painter().text(av_r.center(), Align2::CENTER_CENTER, "@", egui::FontId::proportional(14.0), Color32::WHITE);
                                                     } else {
                                                         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(av_r));
                                                         avatar(&mut child, self.store.avatars.get(&cand.id).map(String::as_str), &cand.name, &cand.id, 28.0);
@@ -2674,13 +2821,13 @@ impl App {
                                                     let tx = av_r.right() + 9.0;
                                                     let max_tw = (row_r.right() - tx - 10.0).max(40.0);
                                                     if cand.subtitle.is_empty() {
-                                                        let fit = fit_text(ui, &format!("@{}", cand.name), &theme::semibold(13.5), max_tw);
-                                                        ui.painter().text(egui::pos2(tx, row_r.center().y), Align2::LEFT_CENTER, fit, theme::semibold(13.5), fg);
+                                                        let fit = fit_text(ui, &format!("@{}", cand.name), &theme::semibold(ui, 13.5), max_tw);
+                                                        ui.painter().text(egui::pos2(tx, row_r.center().y), Align2::LEFT_CENTER, fit, theme::semibold(ui, 13.5), fg);
                                                     } else {
-                                                        let fit = fit_text(ui, &format!("@{}", cand.name), &theme::semibold(13.0), max_tw);
-                                                        let sfit = fit_text(ui, &cand.subtitle, &theme::body(11.0), max_tw);
-                                                        ui.painter().text(egui::pos2(tx, row_r.top() + 5.0), Align2::LEFT_TOP, fit, theme::semibold(13.0), fg);
-                                                        ui.painter().text(egui::pos2(tx, row_r.top() + 21.0), Align2::LEFT_TOP, sfit, theme::body(11.0), sub);
+                                                        let fit = fit_text(ui, &format!("@{}", cand.name), &theme::semibold(ui, 13.0), max_tw);
+                                                        let sfit = fit_text(ui, &cand.subtitle, &theme::body(ui, 11.0), max_tw);
+                                                        ui.painter().text(egui::pos2(tx, row_r.top() + 5.0), Align2::LEFT_TOP, fit, theme::semibold(ui, 13.0), fg);
+                                                        ui.painter().text(egui::pos2(tx, row_r.top() + 21.0 * text_spacing), Align2::LEFT_TOP, sfit, theme::body(ui, 11.0), sub);
                                                     }
                                                     if row_resp.clicked() {
                                                         picked_mention = Some(cand.clone());
@@ -2771,7 +2918,7 @@ impl App {
                     let busy = self.store.history_busy || older_busy;
                     let done = older_done;
                     let label = if busy { "Đang tải…" } else if done { "Đã hết tin nhắn cũ" } else { "⟳ Tải tin nhắn cũ hơn" };
-                    let b = egui::Button::new(RichText::new(label).size(12.0).color(Color32::WHITE)).fill(p.chip).corner_radius(CornerRadius::same(12));
+                    let b = egui::Button::new(RichText::new(label).font(theme::body(ui, 12.0)).color(Color32::WHITE)).fill(p.chip).corner_radius(CornerRadius::same(12));
                     if ui.add_enabled(!busy && !done, b).clicked() {
                         actions.push(Action::LoadEarlier);
                     }
@@ -2820,7 +2967,7 @@ impl App {
                     if is_seen {
                         ui.with_layout(egui::Layout::right_to_left(Align::Min), |ui| {
                             ui.add_space(8.0);
-                            let label = ui.label(RichText::new("Đã xem").size(11.0).color(p.secondary));
+                            let label = ui.label(RichText::new("Đã xem").font(theme::body(ui, 11.0)).color(p.secondary));
                             let mark = egui::Rect::from_center_size(label.rect.left_center() - Vec2::new(8.0, 0.0), Vec2::splat(13.0));
                             icons::paint(ui.painter(), Icon::Checks, mark, p.secondary);
                         });
@@ -2889,7 +3036,7 @@ impl App {
                     if unread_new > 0 {
                         let c = rect.right_top() + Vec2::new(-4.0, 4.0);
                         ui.painter().circle_filled(c, 9.0, p.accent);
-                        ui.painter().text(c, Align2::CENTER_CENTER, unread_new.min(99).to_string(), theme::semibold(10.0), Color32::WHITE);
+                        ui.painter().text(c, Align2::CENTER_CENTER, unread_new.min(99).to_string(), theme::semibold(ui, 10.0), Color32::WHITE);
                     }
                     if resp.clicked() {
                         actions.push(Action::ScrollBottom);
@@ -2980,11 +3127,11 @@ impl App {
                     ui.painter().image(texture.id, img_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
                 }
                 Ok(egui::load::TexturePoll::Pending { .. }) => {
-                    ui.painter().text(screen.center(), Align2::CENTER_CENTER, "Đang tải ảnh…", theme::body(15.0), Color32::from_white_alpha(200));
+                    ui.painter().text(screen.center(), Align2::CENTER_CENTER, "Đang tải ảnh…", theme::body(ui, 15.0), Color32::from_white_alpha(200));
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
                 Err(_) => {
-                    ui.painter().text(screen.center(), Align2::CENTER_CENTER, "Không tải được ảnh (link có thể đã hết hạn)", theme::body(15.0), Color32::from_white_alpha(200));
+                    ui.painter().text(screen.center(), Align2::CENTER_CENTER, "Không tải được ảnh (link có thể đã hết hạn)", theme::body(ui, 15.0), Color32::from_white_alpha(200));
                 }
             }
             if bg.clicked() && !img_rect.is_negative() && !ctx.pointer_interact_pos().map(|p| img_rect.contains(p)).unwrap_or(false) {
@@ -2999,7 +3146,7 @@ impl App {
             });
 
             // top bar: counter on the left, zoom controls and close on the right
-            ui.painter().text(egui::pos2(screen.left() + 20.0, screen.top() + 30.0), Align2::LEFT_CENTER, format!("{} / {}", v.index + 1, n), theme::semibold(14.0), Color32::from_white_alpha(210));
+            ui.painter().text(egui::pos2(screen.left() + 20.0, screen.top() + 30.0), Align2::LEFT_CENTER, format!("{} / {}", v.index + 1, n), theme::semibold(ui, 14.0), Color32::from_white_alpha(210));
             let bar = egui::Rect::from_min_size(egui::pos2(screen.right() - 345.0, screen.top() + 12.0), Vec2::new(333.0, 36.0));
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(Layout::right_to_left(Align::Center)));
             if child.add(egui::Button::new(RichText::new("×").size(16.0).color(Color32::WHITE)).fill(Color32::from_white_alpha(28)).min_size(Vec2::new(36.0, 34.0))).on_hover_text("Đóng (Esc)").clicked() {
@@ -3038,7 +3185,7 @@ impl App {
                     let resp = ui.allocate_rect(r, Sense::click());
                     let a = if resp.hovered() { 70 } else { 38 };
                     ui.painter().circle_filled(r.center(), 22.0, Color32::from_white_alpha(a));
-                    ui.painter().text(r.center() - Vec2::new(0.0, 2.0), Align2::CENTER_CENTER, glyph, theme::semibold(26.0), Color32::WHITE);
+                    ui.painter().text(r.center() - Vec2::new(0.0, 2.0), Align2::CENTER_CENTER, glyph, egui::FontId::proportional(26.0), Color32::WHITE);
                     if resp.clicked() {
                         v.index = (v.index as i32 + dir) as usize;
                         v.zoom = 1.0;
@@ -3046,7 +3193,7 @@ impl App {
                     }
                 }
             }
-            ui.painter().text(egui::pos2(screen.center().x, screen.bottom() - 22.0), Align2::CENTER_CENTER, "Cuộn để phóng to · kéo để di chuyển · nhấp đúp để phóng to nhanh · ← → chuyển ảnh", theme::body(12.0), Color32::from_white_alpha(120));
+            ui.painter().text(egui::pos2(screen.center().x, screen.bottom() - 22.0), Align2::CENTER_CENTER, "Cuộn để phóng to · kéo để di chuyển · nhấp đúp để phóng to nhanh · ← → chuyển ảnh", theme::body(ui, 12.0), Color32::from_white_alpha(120));
         });
 
         if close {
@@ -3063,8 +3210,8 @@ impl App {
             ui.painter().rect_filled(bar, CornerRadius::same(2), p.accent);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new(title).font(theme::semibold(12.5)).color(p.accent));
-                ui.label(RichText::new(preview).size(12.5).color(p.secondary));
+                ui.label(RichText::new(title).font(theme::semibold(ui, 12.5)).color(p.accent));
+                ui.label(RichText::new(preview).font(theme::body(ui, 12.5)).color(p.secondary));
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(egui::Button::new(RichText::new("×").color(p.secondary)).frame(false)).clicked() {
@@ -3127,13 +3274,13 @@ impl App {
                     let mut hits: Vec<(egui::Rect, Hit)> = Vec::new();
                     let frame_resp = egui::Frame::new().fill(fill).corner_radius(cr).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
                         if !mine && is_group && meta.first {
-                            ui.label(RichText::new(self.store.sender_name(&m.sender)).font(theme::semibold(13.0)).color(theme::avatar_color(&m.sender)));
+                            ui.label(RichText::new(self.store.sender_name(&m.sender)).font(theme::semibold(ui, 13.0)).color(theme::avatar_color(&m.sender)));
                         }
                         if m.reply_text.is_some() || m.reply_id.is_some() {
                             let quote = m.reply_text.as_deref().unwrap_or("Tin nhắn được trích dẫn");
                             let t: String = quote.chars().take(120).collect();
                             let r = egui::Frame::new().fill(p.accent.gamma_multiply(0.18)).corner_radius(CornerRadius::same(4)).inner_margin(Margin { left: 9, right: 6, top: 3, bottom: 3 }).show(ui, |ui| {
-                                ui.label(RichText::new(t).size(12.5).color(if mine { p.text_out } else { p.text }));
+                                ui.label(RichText::new(t).font(theme::body(ui, 12.5)).color(if mine { p.text_out } else { p.text }));
                             });
                             let rr = r.response.rect;
                             let bar = if mine { p.text_out } else { p.accent };
@@ -3154,18 +3301,18 @@ impl App {
                                     let domain = l.domain();
                                     let src = if !l.source.is_empty() { l.source.clone() } else { domain.clone() };
                                     if !src.is_empty() {
-                                        ui.label(RichText::new(src.to_uppercase()).size(10.5).color(sub));
+                                        ui.label(RichText::new(src.to_uppercase()).font(theme::body(ui, 10.5)).color(sub));
                                     }
                                     if !l.title.is_empty() {
-                                        ui.label(RichText::new(&l.title).font(theme::semibold(13.5)).color(fg));
+                                        ui.label(RichText::new(&l.title).font(theme::semibold(ui, 13.5)).color(fg));
                                     }
                                     let desc = if !l.description.is_empty() { &l.description } else { &l.subtitle };
                                     if !desc.is_empty() {
                                         let d: String = desc.chars().take(160).collect();
-                                        ui.label(RichText::new(d).size(12.5).color(sub));
+                                        ui.label(RichText::new(d).font(theme::body(ui, 12.5)).color(sub));
                                     }
                                     if !l.url.is_empty() {
-                                        ui.add(egui::Label::new(RichText::new(&l.url).size(11.5).color(p.link).underline()).truncate());
+                                        ui.add(egui::Label::new(RichText::new(&l.url).font(theme::body(ui, 11.5)).color(p.link).underline()).truncate());
                                     }
                                 });
                             });
@@ -3175,11 +3322,11 @@ impl App {
                         }
                         if let (Some(_), Some(r)) = (&m.media_kind, &m.media_ref) {
                             if imageish && !crate::cache::exists(r) {
-                                ui.label(RichText::new("Ảnh đã bị xóa khỏi bộ nhớ đệm").size(12.5).color(p.secondary));
+                                ui.label(RichText::new("Ảnh đã bị xóa khỏi bộ nhớ đệm").font(theme::body(ui, 12.5)).color(p.secondary));
                             } else if imageish {
                                 let resp = ui.add(egui::Image::new(media_uri(r)).fit_to_original_size(1.0).max_size(if is_sticker { Vec2::splat(120.0) } else { Vec2::new(280.0, 320.0) }).corner_radius(CornerRadius::same(if is_sticker { 0 } else { 10 })).sense(Sense::click()));
                                 if !has_text && !is_sticker {
-                                    let galley = ui.painter().layout_no_wrap(time.clone(), theme::body(11.0), Color32::WHITE);
+                                    let galley = ui.painter().layout_no_wrap(time.clone(), theme::body(ui, 11.0), Color32::WHITE);
                                     let width = galley.size().x + if status.is_some() { 15.0 } else { 0.0 };
                                     let pill = egui::Rect::from_min_size(
                                         resp.rect.right_bottom() - Vec2::new(width + 14.0, galley.size().y + 8.0),
@@ -3198,7 +3345,7 @@ impl App {
                                     _ => "Lưu tệp…",
                                 };
                                 if !crate::cache::exists(r) {
-                                    ui.label(RichText::new("Tệp đã bị xóa khỏi bộ nhớ đệm").size(12.5).color(p.secondary));
+                                    ui.label(RichText::new("Tệp đã bị xóa khỏi bộ nhớ đệm").font(theme::body(ui, 12.5)).color(p.secondary));
                                 } else {
                                     let b = ui.button(label);
                                     hits.push((b.rect, if matches!(kind.as_str(), "video" | "audio") { Hit::Play(r.clone()) } else { Hit::File(r.clone()) }));
@@ -3215,7 +3362,7 @@ impl App {
                                     for seg in crate::emoji::split(text) {
                                         match seg {
                                             crate::emoji::Seg::Text(t) => {
-                                                ui.label(RichText::new(t).font(theme::body(14.5)).color(fg));
+                                                ui.label(RichText::new(t).font(theme::body(ui, 14.5)).color(fg));
                                             }
                                             crate::emoji::Seg::Emoji(e) => {
                                                 ui.add(egui::Image::new(crate::emoji::uri(e)).fit_to_exact_size(Vec2::splat(size)).alt_text(e.to_string()));
@@ -3224,11 +3371,11 @@ impl App {
                                     }
                                 });
                             } else {
-                                ui.add(egui::Label::new(RichText::new(text).font(theme::body(14.5)).color(fg)).wrap());
+                                ui.add(egui::Label::new(RichText::new(text).font(theme::body(ui, 14.5)).color(fg)).wrap());
                             }
                         }
                         if has_text || !imageish || is_sticker {
-                            let galley = ui.painter().layout_no_wrap(time.clone(), theme::body(11.0), time_col);
+                            let galley = ui.painter().layout_no_wrap(time.clone(), theme::body(ui, 11.0), time_col);
                             let width = galley.size().x + if status.is_some() { 15.0 } else { 0.0 };
                             let (rect, _) = ui.allocate_exact_size(Vec2::new(width, galley.size().y.max(12.0)), Sense::hover());
                             paint_message_time(ui, rect.min, galley, time_col, status);
@@ -3257,7 +3404,7 @@ impl App {
                                 let count = actors.len();
                                 let icon = egui::Image::new(crate::emoji::uri(emoji)).fit_to_exact_size(Vec2::splat(16.0)).alt_text(emoji);
                                 let button = if count > 1 {
-                                    let text = RichText::new(count.to_string()).size(12.5).color(if mine_here { Color32::WHITE } else { p.text });
+                                    let text = RichText::new(count.to_string()).font(theme::body(ui, 12.5)).color(if mine_here { Color32::WHITE } else { p.text });
                                     egui::Button::image_and_text(icon, text)
                                 } else {
                                     egui::Button::image(icon)
@@ -3480,26 +3627,30 @@ impl eframe::App for App {
         }
 
         // files dragged onto the window, and Ctrl+V with a picture on the clipboard
-        if self.screen == Screen::Main && self.selected.is_some() && self.backend.is_some() && self.outgoing.is_empty() {
-            for f in ctx.input(|i| i.raw.dropped_files.clone()) {
-                if let Some(p) = f.path {
-                    self.outgoing.push((p, false));
+        if let Some(thread) = self.selected.clone().filter(|_| {
+            self.screen == Screen::Main && self.backend.is_some() && self.outgoing.is_none()
+                && !self.settings_open && self.viewer.is_none()
+        }) {
+            let files: Vec<_> = ctx.input(|input| input.raw.dropped_files.iter()
+                .filter_map(|file| file.path.clone().map(|path| (path, false))).collect());
+            if !files.is_empty() {
+                self.outgoing = Some(OutgoingFiles { thread, files });
+            } else {
+                #[cfg(windows)]
+                {
+                    let down = ctx.input(|i| i.focused) && unsafe {
+                        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                        GetAsyncKeyState(0x11) < 0 && GetAsyncKeyState(0x56) < 0
+                    };
+                    if down && !self.paste_down {
+                        self.paste_clipboard_image(thread);
+                    }
+                    self.paste_down = down;
                 }
-            }
-            #[cfg(windows)]
-            {
-                let down = ctx.input(|i| i.focused) && unsafe {
-                    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-                    GetAsyncKeyState(0x11) < 0 && GetAsyncKeyState(0x56) < 0
-                };
-                if down && !self.paste_down {
-                    self.paste_clipboard_image();
+                #[cfg(target_os = "macos")]
+                if ctx.input(|i| i.focused && i.modifiers.command && i.key_pressed(egui::Key::V)) {
+                    self.paste_clipboard_image(thread);
                 }
-                self.paste_down = down;
-            }
-            #[cfg(target_os = "macos")]
-            if ctx.input(|i| i.focused && i.modifiers.command && i.key_pressed(egui::Key::V)) {
-                self.paste_clipboard_image();
             }
         }
 
@@ -3574,7 +3725,7 @@ impl eframe::App for App {
                 if self.settings_open {
                     self.draw_settings(ctx);
                 }
-                if !self.outgoing.is_empty() {
+                if self.outgoing.is_some() {
                     self.draw_outgoing(ctx);
                 }
                 if self.viewer.is_some() {
@@ -3589,6 +3740,14 @@ impl eframe::App for App {
 #[cfg(test)]
 mod mention_tests {
     use super::*;
+
+    #[test]
+    fn chat_previews_use_plain_attachment_labels_and_keep_emoji_messages() {
+        assert_eq!(chat_preview_text("Long: 📷 Photo"), "Ảnh");
+        assert_eq!(chat_preview_text("🎬 Video"), "Video");
+        assert_eq!(chat_preview_text("Long: 🤣"), "Long: 🤣");
+        assert_eq!(chat_preview_text("Long: gửi video nhé"), "Long: gửi video nhé");
+    }
 
     #[test]
     fn vietnamese_folding_and_query_detection() {
